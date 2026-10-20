@@ -174,3 +174,34 @@ func TestCollectSaysWhatItCouldNotRead(t *testing.T) {
 		t.Error("lists must be empty lists, not null, in the JSON")
 	}
 }
+
+func TestArm64HasNoCPUFlagSoAUsableKVMDeviceIsTheEvidence(t *testing.T) {
+	cpu := ParseCPUInfo("processor : 0\nBogoMIPS : 48.00\nFeatures : fp asimd\nCPU implementer : 0x61\nCPU part : 0x000\n")
+	if cpu.Virtualisation.Supported || cpu.Model != "ARM CPU (implementer 0x61, part 0x000)" {
+		t.Fatalf("%+v", cpu)
+	}
+	v := Virtualisation{KVMDevice: true, KVMReadWrite: true}
+	AdjustVirtualisationForArch("arm64", &v)
+	if !v.Supported || v.Flag != "kvm" {
+		t.Errorf("a usable /dev/kvm on arm64 was not accepted: %+v", v)
+	}
+	for _, c := range []struct {
+		arch string
+		v    Virtualisation
+	}{{"amd64", Virtualisation{KVMDevice: true, KVMReadWrite: true}}, {"arm64", Virtualisation{KVMDevice: true}}, {"arm64", Virtualisation{}}} {
+		v := c.v
+		AdjustVirtualisationForArch(c.arch, &v)
+		if v.Supported {
+			t.Errorf("%s %+v was accepted without the evidence", c.arch, c.v)
+		}
+	}
+}
+
+func TestTheInterruptControllerIsReadFromProcInterrupts(t *testing.T) {
+	cases := map[string]string{"  3:  100  GICv3  30 Level  arch_timer\n": "GICv3", "  3:  100  GICv2  30 Level  arch_timer\n": "GICv2", "  3:  100  GIC-400  30 Level\n": "GICv2", "  0:  5  IO-APIC  2-edge  timer\n": ""}
+	for text, want := range cases {
+		if got := ParseInterruptController(text); got != want {
+			t.Errorf("%q: got %q, want %q", text, got, want)
+		}
+	}
+}

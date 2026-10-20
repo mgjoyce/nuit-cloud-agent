@@ -44,13 +44,16 @@ type OS struct {
 type CPU struct {
 	Model   string `json:"model"`
 	Logical int    `json:"logical"`
+	// InterruptController is the interrupt controller an arm64 machine has (GICv3, GICv2), read from /proc/interrupts. The
+	// arm64 virtual machine monitor of the Nuit Container Service needs GICv3. Empty on other CPUs or when it cannot be read.
+	InterruptController string `json:"interruptController,omitempty"`
 	// Virtualisation is whether the CPU can run the hardware-assisted virtual machines the Nuit Container Service needs.
 	Virtualisation Virtualisation `json:"virtualisation"`
 }
 
 type Virtualisation struct {
 	Supported    bool   `json:"supported"`
-	Flag         string `json:"flag,omitempty"` // vmx (Intel) or svm (AMD)
+	Flag         string `json:"flag,omitempty"` // vmx (Intel), svm (AMD), or kvm (arm64, which has no CPU flag)
 	KVMDevice    bool   `json:"kvmDevice"`      // /dev/kvm exists
 	KVMReadWrite bool   `json:"kvmReadWrite"`   // and this process can open it
 }
@@ -180,6 +183,12 @@ func Collect(ctx context.Context, s Sources) Report {
 		r.CPU.Virtualisation.KVMDevice = true
 		r.CPU.Virtualisation.KVMReadWrite = s.Open(s.path("/dev/kvm")) == nil
 	}
+	AdjustVirtualisationForArch(r.OS.Arch, &r.CPU.Virtualisation)
+	if r.OS.Arch == "arm64" {
+		if text, err := s.read("/proc/interrupts"); err == nil {
+			r.CPU.InterruptController = ParseInterruptController(text)
+		}
+	}
 	if text, err := s.read("/proc/meminfo"); err == nil {
 		r.Memory = ParseMemInfo(text)
 	} else {
@@ -234,10 +243,32 @@ func ParseOSRelease(text string) OS {
 	return o
 }
 
+// AdjustVirtualisationForArch: arm64 CPUs publish no vmx/svm-style flag; the kernel offers /dev/kvm only when the machine booted
+// able to run KVM, so a usable /dev/kvm is the evidence of hardware virtualisation there.
+func AdjustVirtualisationForArch(arch string, v *Virtualisation) {
+	if arch == "arm64" && !v.Supported && v.KVMDevice && v.KVMReadWrite {
+		v.Supported, v.Flag = true, "kvm"
+	}
+}
+
+// ParseInterruptController finds the ARM generic interrupt controller in /proc/interrupts ("GICv3", "GICv2"), or "".
+func ParseInterruptController(text string) string {
+	for _, gic := range []string{"GICv3", "GICv2", "GIC-400"} {
+		if strings.Contains(text, gic) {
+			if gic == "GIC-400" {
+				return "GICv2" // the GIC-400 is a GICv2 implementation
+			}
+			return gic
+		}
+	}
+	return ""
+}
+
 // ParseCPUInfo reads /proc/cpuinfo: the model, the number of logical CPUs, and whether the CPU has the hardware
 // virtualisation flag (vmx on Intel, svm on AMD).
 func ParseCPUInfo(text string) CPU {
 	var c CPU
+	var implementer, part string
 	for _, line := range strings.Split(text, "\n") {
 		k, v, ok := strings.Cut(line, ":")
 		if !ok {
@@ -245,6 +276,14 @@ func ParseCPUInfo(text string) CPU {
 		}
 		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
 		switch k {
+		case "CPU implementer":
+			if implementer == "" {
+				implementer = v
+			}
+		case "CPU part":
+			if part == "" {
+				part = v
+			}
 		case "processor":
 			c.Logical++
 		case "model name", "Model", "cpu model":
@@ -262,6 +301,10 @@ func ParseCPUInfo(text string) CPU {
 				}
 			}
 		}
+	}
+	if c.Model == "" && implementer != "" {
+		// arm64 /proc/cpuinfo names no model, only an implementer and part code (0x61 is Apple)
+		c.Model = "ARM CPU (implementer " + implementer + ", part " + part + ")"
 	}
 	return c
 }
