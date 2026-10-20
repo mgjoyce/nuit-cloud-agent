@@ -383,6 +383,40 @@ addr_neutralise() { # addr_neutralise <file> <interface>
   ' "$1"
 }
 
+# Everything else on the machine that depends on the network: every IPv4 address (VLAN interfaces, tenant addresses), every route
+# and every policy rule. Taken before the change, so the change can be proved not to have lost any of it, and so the rollback
+# can put back what was lost.
+addr_snapshot() { # addr_snapshot <dir>
+  ip -4 -o addr show 2>/dev/null | awk '{print $2, $4}' | sort >"$1/before.addrs"
+  ip -4 route show 2>/dev/null | sort >"$1/before.routes"
+  ip -4 rule show 2>/dev/null | sed 's/^[0-9]*:[[:space:]]*//' | sort >"$1/before.rules"
+}
+# What the snapshot had that is gone now, ignoring what the change was meant to replace (the old address and routes that name it).
+# Writes one line per loss ("addr <if> <cidr>", "route <route>", "rule <rule>") to <dir>/lost and returns 1 if there is any.
+addr_lost() { # addr_lost <dir> <old address or empty>
+  ld="$1"; lold="$2"
+  ip -4 -o addr show 2>/dev/null | awk '{print $2, $4}' | sort >"$ld/after.addrs"
+  ip -4 route show 2>/dev/null | sort >"$ld/after.routes"
+  ip -4 rule show 2>/dev/null | sed 's/^[0-9]*:[[:space:]]*//' | sort >"$ld/after.rules"
+  : >"$ld/lost"
+  for kind in addrs routes rules; do
+    comm -23 "$ld/before.$kind" "$ld/after.$kind" | while IFS= read -r line; do
+      if [ -n "$lold" ]; then case "$line" in *" $lold/"*|*"src $lold"*|*" $lold "*) continue ;; esac; fi
+      printf '%s %s\n' "${kind%s}" "$line" >>"$ld/lost"
+    done
+  done
+  [ ! -s "$ld/lost" ]
+}
+# Put back what is missing: an address by "ip addr add", a route by "ip route replace". Rules are reported, not restored.
+addr_heal() { # addr_heal <dir>
+  while IFS= read -r l; do
+    case "$l" in
+      "addr "*) set -- ${l#addr }; ip addr add "$2" dev "$1" 2>/dev/null || true ;;
+      "route "*) ip route replace ${l#route } 2>/dev/null || true ;;
+    esac
+  done <"$1/lost"
+}
+
 f_ncs_address_do() {
   target="${NCS_MANAGEMENT_ADDRESS:-}"
   [ -n "$target" ] || { echo "  no management address was given: allocate one in the portal, then apply this profile from there" >&2; return 3; }
@@ -415,6 +449,7 @@ f_ncs_address_do() {
 
   # backups, then the timer that undoes everything
   d="$(p "$ADDR_DIR")"; rm -rf "$d/backup"; mkdir -p "$d/backup"; chmod 700 "$d"
+  addr_snapshot "$d"
   : >"$d/backup/files"
   for f in $files; do cp -p "$f" "$d/backup/$(printf '%s' "$f" | tr '/' '_')" && printf '%s\n' "$f" >>"$d/backup/files"; done
   dhcp_was=0; for f in $files; do grep -Eq "^[[:space:]]*iface[[:space:]]+$A_IF[[:space:]]+inet[[:space:]]+dhcp" "$f" && dhcp_was=1; done
@@ -430,6 +465,9 @@ ip addr add $A_CUR/$A_PREFIX dev $A_IF 2>/dev/null
 [ "$added" = 1 ] && ip addr del $target/$A_PREFIX dev $A_IF 2>/dev/null
 ip route replace default via $A_GW dev $A_IF 2>/dev/null
 [ "$dhcp_was" = 1 ] && ifup --force $A_IF 2>/dev/null
+# and whatever else the machine had on its network: VLAN interfaces, tenant addresses, routes (put back if they are missing)
+if [ -f "$d/before.addrs" ]; then while read -r ifc cidr; do ip addr add "\$cidr" dev "\$ifc" 2>/dev/null; done <"$d/before.addrs"; fi
+if [ -f "$d/before.routes" ]; then while IFS= read -r line; do ip route replace \$line 2>/dev/null; done <"$d/before.routes"; fi
 rm -f "$d/armed"
 exit 0
 ROLLBACK
@@ -469,7 +507,20 @@ STATIC
     ip route replace default via "$A_GW" dev "$A_IF" 2>/dev/null || true
   fi
 
-  # 5. proof: the platform must be reachable from the new address
+  # 5. nothing else may have been lost (VLAN interfaces, tenant addresses, routes): what is missing is put back, and if it still
+  #    is, everything is undone
+  old_for_check=""; [ "$added" = 1 ] && old_for_check="$A_CUR"
+  if ! addr_lost "$d" "$old_for_check"; then
+    addr_heal "$d"
+    if ! addr_lost "$d" "$old_for_check"; then
+      lost_list="$(tr '\n' ';' <"$d/lost")"
+      sh "$d/rollback.sh"
+      echo "  the change would have lost other network configuration ($lost_list), so the old configuration was put back" >&2
+      return 1
+    fi
+  fi
+
+  # 6. proof: the platform must be reachable from the new address
   proved=0
   if [ -n "${NCS_PLATFORM_URL:-}" ]; then
     for _ in 1 2 3 4 5 6; do
