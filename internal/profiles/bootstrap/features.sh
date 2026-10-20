@@ -199,3 +199,48 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 # installer for it is not built yet (ticket #39), so until it is this says what is missing.
 f_oci_saas_runtime_ok() { [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet oci-saas-containerd; }
 f_oci_saas_runtime_do() { echo "  install the Nuit Container Service runtime from the signed bundle (INSTALL.txt inside it); automating that is ticket #39" >&2; return 3; }
+
+# Tenants' volumes are disk images under the runtime's directory (default /var/lib/oci-saas) and need room to grow. If the
+# filesystem that directory would be on has less than MIN_VOLUMES_GIB free and another real filesystem has far more, the
+# directory is put on that one with a bind mount (the runtime sees an ordinary directory). It never touches a directory
+# that already has content, and the fstab line is `nofail`, so a mistake cannot stop the machine booting.
+VOLUMES_DIR="${VOLUMES_DIR:-/var/lib/oci-saas}"
+MIN_VOLUMES_GIB="${MIN_VOLUMES_GIB:-20}"
+
+# Free space in KiB on the filesystem that holds <path>, or on its nearest existing parent.
+free_kib_of() {
+  d="$1"; while [ ! -e "$d" ] && [ "$d" != / ]; do d="$(dirname "$d")"; done
+  df -Pk "$d" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+# The real filesystems worth putting volumes on, one per line: "<free KiB> <mount point>", roomiest first. Not the boot
+# partitions, not virtual or removable filesystems, and not the filesystem the volumes directory is already on.
+roomy_mounts() {
+  here="$(free_kib_of "$(p "$VOLUMES_DIR")")"
+  awk '$3 ~ /^(ext[234]|xfs|btrfs|f2fs)$/ {print $2}' "$(p /proc/mounts)" 2>/dev/null | while read -r m; do
+    case "$m" in /boot|/boot/*|/run|/run/*|/snap/*|/var/lib/docker/*) continue ;; esac
+    free="$(df -Pk "$(p "$m")" 2>/dev/null | awk 'NR==2 {print $4}')"
+    [ -n "$free" ] && [ "$free" != "$here" ] && echo "$free $m"
+  done | sort -rn
+}
+f_ncs_volumes_ok() {
+  mountpoint -q "$(p "$VOLUMES_DIR")" 2>/dev/null && return 0              # already its own mount (a bind mount or a volume)
+  free="$(free_kib_of "$(p "$VOLUMES_DIR")")"
+  [ -n "$free" ] && [ "$free" -ge $((MIN_VOLUMES_GIB * 1024 * 1024)) ]       # or it already has room
+}
+f_ncs_volumes_do() {
+  dest="$(p "$VOLUMES_DIR")"
+  if [ -d "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+    echo "  $VOLUMES_DIR already has content and not enough room: move it by hand, then bind-mount the new place onto it" >&2; return 3
+  fi
+  here="$(free_kib_of "$dest")"
+  pick="$(roomy_mounts | awk -v here="${here:-0}" -v min=$((MIN_VOLUMES_GIB * 1024 * 1024)) '$1 >= min && $1 >= here * 4 {print; exit}')"
+  if [ -z "$pick" ]; then echo "  no filesystem has $MIN_VOLUMES_GIB GiB and four times the room of the one $VOLUMES_DIR is on: grow one, or add a disk" >&2; return 3; fi
+  mnt="${pick#* }"; src="${mnt%/}/oci-saas"
+  echo "  putting $VOLUMES_DIR on $mnt ($((${pick%% *} / 1024 / 1024)) GiB free) as $src" >&2
+  mkdir -p "$(p "$src")" "$dest"
+  chmod 755 "$(p "$src")" "$dest"
+  line="$src $VOLUMES_DIR none bind,nofail,x-systemd.requires-mounts-for=$mnt 0 0"
+  grep -qsF " $VOLUMES_DIR " "$(p /etc/fstab)" 2>/dev/null || printf '%s\n' "$line" >>"$(p /etc/fstab)"
+  systemctl daemon-reload 2>/dev/null || true
+  mount "$VOLUMES_DIR"
+}
