@@ -207,10 +207,12 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 # Run by hand without them, the feature says what is missing. The first install gives the node the bundle's initial policy, which
 # admits namespace nuit-cloud-platform only; the platform's hourly policy-sync replaces it once the node is a registered pool host.
 OCISAAS_ETC="${OCISAAS_ETC:-/etc/oci-saas}"
+# The bundle's smoke test (a pod in a microVM answers HTTP) is kept here so the agent's runtime-smoke task can run it later: root-owned, copied from the verified bundle.
+OCISAAS_SMOKE="${OCISAAS_SMOKE:-/usr/local/lib/nuit-cloud/oci-saas-smoke.sh}"
 f_oci_saas_runtime_ok() {
   [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas \
     && [ -e "$(p /run/oci-saas/containerd.sock)" ] \
-    && [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ] || return 1
+    && [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ] && [ -x "$(p "$OCISAAS_SMOKE")" ] || return 1
   # when the platform names a bundle, the one installed must be it (an upgrade then shows as drift)
   [ -z "${NCS_RUNTIME_BUNDLE_SHA256:-}" ] || [ "$(cat "$(p "$OCISAAS_ETC/installed-bundle")" 2>/dev/null)" = "$NCS_RUNTIME_BUNDLE_SHA256" ]
 }
@@ -235,7 +237,7 @@ f_oci_saas_runtime_do() {
     echo "  /usr/bin/containerd is $have; the runtime needs 2.x and will not replace another service's containerd: a person decides" >&2; return 3
   fi
 
-  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd || return 1
+  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd python3-minimal || return 1
 
   work="$(mktemp -d)"
   tar -xzf "$NCS_RUNTIME_BUNDLE" -C "$work" || { rm -rf "$work"; echo "  the bundle is not a readable tarball" >&2; return 1; }
@@ -265,7 +267,8 @@ f_oci_saas_runtime_do() {
   "$dir/packaging/dedicated/install.sh" --bin "$dir/bin" --guest "$dir/guest" --artifacts-pub "$dir/artifacts.pub" \
     --policy-pub "$dir/policy.pub" $mode --cni-bin /usr/lib/cni --add-user "$NC_USER" \
     || { rm -rf "$work"; echo "  the bundle's install.sh failed (its output is above)" >&2; return 1; }
-  mkdir -p "$(p "$OCISAAS_ETC")"
+  mkdir -p "$(p "$OCISAAS_ETC")" "$(dirname "$(p "$OCISAAS_SMOKE")")"
+  install -m 0755 "$dir/packaging/dedicated/smoke.sh" "$(p "$OCISAAS_SMOKE")"
   printf '%s\n' "${NCS_RUNTIME_BUNDLE_SHA256:-unknown}" >"$(p "$OCISAAS_ETC/installed-bundle")"
   rm -rf "$work"
 }

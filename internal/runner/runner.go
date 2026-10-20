@@ -4,7 +4,12 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +41,8 @@ type Runner struct {
 	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
 	Runtime RuntimeStager
 	Updater SelfUpdater
+	// Smoke runs the runtime's smoke test in a namespace and returns what it printed and its exit status; injectable for tests.
+	Smoke func(ctx context.Context, namespace string) (string, int, error)
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -46,7 +53,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -75,6 +82,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.profile(ctx, task)
 	case "update-agent":
 		return r.selfUpdate(ctx, task)
+	case "runtime-smoke":
+		return r.smoke(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -192,4 +201,47 @@ func (r Runner) selfUpdate(ctx context.Context, task *taskverify.Task) client.Re
 		r.Restart.Store(true)
 	}
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("updated from %s to %s; restarting to start the new version", outcome.From, outcome.To), Result: outcome}
+}
+
+var smokeNamespace = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// SmokePath is where the runtime feature keeps the bundle's smoke test (copied from the verified bundle when it is installed).
+const SmokePath = "/usr/local/lib/nuit-cloud/oci-saas-smoke.sh"
+
+// RunSmoke is the real smoke test: the script the runtime's install left on the machine, run as root.
+func RunSmoke(ctx context.Context, namespace string) (string, int, error) {
+	if _, err := os.Stat(SmokePath); err != nil {
+		return "", 0, fmt.Errorf("the runtime's smoke test is not on this machine (%s): apply the nuit-container-service profile first", SmokePath)
+	}
+	out, err := exec.CommandContext(ctx, "bash", SmokePath, namespace).CombinedOutput()
+	exit := 0
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		exit, err = ee.ExitCode(), nil
+	}
+	return string(out), exit, err
+}
+
+// smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.
+func (r Runner) smoke(ctx context.Context, task *taskverify.Task) client.Report {
+	one := 1
+	ns, _ := task.Params["namespace"].(string)
+	if !smokeNamespace.MatchString(ns) {
+		return client.Report{Status: "failed", ExitCode: &one, Output: "the smoke test needs a namespace name"}
+	}
+	run := r.Smoke
+	if run == nil {
+		run = RunSmoke
+	}
+	out, exit, err := run(ctx, ns)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	passed := exit == 0 && strings.Contains(out, "SMOKE OK")
+	res := map[string]any{"namespace": ns, "passed": passed}
+	status := "done"
+	if !passed {
+		status = "failed"
+	}
+	return client.Report{Status: status, ExitCode: &exit, Output: profiles.Truncate(out, 32*1024), Result: res}
 }

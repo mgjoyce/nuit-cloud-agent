@@ -297,3 +297,42 @@ func TestBadRuntimeParametersAreRefused(t *testing.T) {
 		t.Errorf("%+v", rep)
 	}
 }
+
+func smokeTask(ns string) *taskverify.Task {
+	return &taskverify.Task{Name: "runtime-smoke", TimeoutSeconds: 30, Params: map[string]any{"namespace": ns}}
+}
+
+func TestTheSmokeTestPassesOnlyWhenItSaysSoAndExitsZero(t *testing.T) {
+	r := newRunner()
+	r.Smoke = func(_ context.Context, ns string) (string, int, error) {
+		return "pod up in " + ns + "\nSMOKE OK\n", 0, nil
+	}
+	if rep := r.Run(context.Background(), smokeTask("nuit-cloud-platform")); rep.Status != "done" || rep.Result.(map[string]any)["passed"] != true {
+		t.Errorf("%+v", rep)
+	}
+	r.Smoke = func(context.Context, string) (string, int, error) {
+		return "GET http://10.89.0.2/ -> 000\nSMOKE FAILED\n", 1, nil
+	}
+	if rep := r.Run(context.Background(), smokeTask("nuit-cloud-platform")); rep.Status != "failed" || !strings.Contains(rep.Output, "SMOKE FAILED") {
+		t.Errorf("%+v", rep)
+	}
+	r.Smoke = func(context.Context, string) (string, int, error) { return "SMOKE OK but the script died\n", 2, nil }
+	if rep := r.Run(context.Background(), smokeTask("x")); rep.Status != "failed" {
+		t.Errorf("an exit status of 2 passed: %+v", rep)
+	}
+}
+
+func TestTheSmokeTestRefusesAnOddNamespaceAndReportsAMissingScript(t *testing.T) {
+	r := newRunner()
+	called := false
+	r.Smoke = func(context.Context, string) (string, int, error) { called = true; return "", 0, nil }
+	if rep := r.Run(context.Background(), smokeTask("../etc; rm -rf /")); rep.Status != "failed" || called {
+		t.Errorf("%+v called=%v", rep, called)
+	}
+	r.Smoke = func(context.Context, string) (string, int, error) {
+		return "", 0, errors.New("the runtime's smoke test is not on this machine")
+	}
+	if rep := r.Run(context.Background(), smokeTask("nuit-cloud-platform")); rep.Status != "failed" || !strings.Contains(rep.Output, "not on this machine") {
+		t.Errorf("%+v", rep)
+	}
+}
