@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
@@ -44,6 +45,8 @@ type Runner struct {
 	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
 	Runtime RuntimeStager
 	Updater SelfUpdater
+	// Scan asks which addresses of a private range answer on the machine's network; injectable for tests.
+	Scan func(ctx context.Context, first, last string) (lanscan.Result, error)
 	// Smoke runs the runtime's smoke test in a namespace and returns what it printed and its exit status; injectable for tests.
 	Smoke func(ctx context.Context, namespace string) (string, int, error)
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
@@ -56,7 +59,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -87,6 +90,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.selfUpdate(ctx, task)
 	case "runtime-smoke":
 		return r.smoke(ctx, task)
+	case "address-scan":
+		return r.scan(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -256,4 +261,20 @@ func (r Runner) smoke(ctx context.Context, task *taskverify.Task) client.Report 
 		status = "failed"
 	}
 	return client.Report{Status: status, ExitCode: &exit, Output: profiles.Truncate(out, 32*1024), Result: res}
+}
+
+// scan asks which addresses of the range answer. It changes nothing; an answer is a fact about the network, not a judgement.
+func (r Runner) scan(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	first, _ := task.Params["first"].(string)
+	last, _ := task.Params["last"].(string)
+	run := r.Scan
+	if run == nil {
+		run = lanscan.Real().Scan
+	}
+	res, err := run(ctx, first, last)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("scanned %d addresses from %s (%s): %d answered", res.Scanned, res.From, res.Method, len(res.Answered)), Result: res}
 }

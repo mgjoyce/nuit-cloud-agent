@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
@@ -352,5 +353,26 @@ func TestTheManagementAddressReachesTheScriptsAsEnvironment(t *testing.T) {
 		if rep := r2.Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
 			t.Errorf("%q: %+v calls=%v", bad, rep, f2.calls)
 		}
+	}
+}
+
+func TestAnAddressScanReportsWhatAnswered(t *testing.T) {
+	r := newRunner()
+	r.Scan = func(_ context.Context, first, last string) (lanscan.Result, error) {
+		if first != "10.10.10.161" || last != "10.10.10.199" {
+			t.Errorf("scanned %s-%s", first, last)
+		}
+		return lanscan.Result{From: "eth0", Method: "arping", Scanned: 38, Answered: []lanscan.Answer{{Address: "10.10.10.170", MAC: "aa:bb"}}}, nil
+	}
+	task := &taskverify.Task{Name: "address-scan", TimeoutSeconds: 30, Params: map[string]any{"first": "10.10.10.161", "last": "10.10.10.199"}}
+	rep := r.Run(context.Background(), task)
+	if rep.Status != "done" || rep.Output != "scanned 38 addresses from eth0 (arping): 1 answered" {
+		t.Errorf("%+v", rep)
+	}
+	r.Scan = func(context.Context, string, string) (lanscan.Result, error) {
+		return lanscan.Result{}, errors.New("a scan only looks at private addresses")
+	}
+	if rep := r.Run(context.Background(), task); rep.Status != "failed" || !strings.Contains(rep.Output, "private") {
+		t.Errorf("%+v", rep)
 	}
 }

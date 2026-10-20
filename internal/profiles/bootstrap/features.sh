@@ -143,8 +143,8 @@ summary() {
 # at the hardware (a cable, the BIOS) is reported MANUAL and never changed behind their back.
 
 # What the agent and the runtime need on a minimal Debian: a way to fetch things over TLS, and the network tools.
-f_ncs_packages_ok() { dpkg -s ca-certificates >/dev/null 2>&1 && dpkg -s curl >/dev/null 2>&1 && dpkg -s iproute2 >/dev/null 2>&1; }
-f_ncs_packages_do() { apt-get update -qq && apt-get install -y -qq ca-certificates curl iproute2; }
+f_ncs_packages_ok() { dpkg -s ca-certificates >/dev/null 2>&1 && dpkg -s curl >/dev/null 2>&1 && dpkg -s iproute2 >/dev/null 2>&1 && dpkg -s iputils-arping >/dev/null 2>&1; }
+f_ncs_packages_do() { apt-get update -qq && apt-get install -y -qq ca-certificates curl iproute2 iputils-arping; }
 
 # Wired by default: at least one physical, non-wireless interface that is up and has an address. A cable is a person's job.
 f_ncs_wired_ok() {
