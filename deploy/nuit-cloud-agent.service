@@ -1,0 +1,24 @@
+[Unit]
+Description=Nuit Cloud agent
+Documentation=https://github.com/mgjoyce/nuit-cloud/blob/main/docs/adr/0001-machines-are-commissioned-by-a-pull-agent.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nuit-cloud-agent run
+Restart=always
+RestartSec=10
+# The agent keeps its identity here, readable by root only.
+StateDirectory=nuit-cloud-agent
+StateDirectoryMode=0700
+Environment=NUIT_CLOUD_AGENT_STATE_DIR=/var/lib/nuit-cloud-agent
+# It runs as root (installing a profile needs it) and opens no port: it only calls out.
+PrivateTmp=true
+ProtectHome=read-only
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

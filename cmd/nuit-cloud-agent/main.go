@@ -1,0 +1,178 @@
+// nuit-cloud-agent is the program a Nuit Cloud Server runs so the platform can commission and look after it.
+//
+// It only ever calls out to the platform; it listens on nothing. It does only what the platform signs and its own catalog
+// allows (see ADR 0001 in the nuit-cloud repository).
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
+)
+
+// version is set at build time: -ldflags "-X main.version=1.2.3".
+var version = "dev"
+
+const defaultStateDir = "/var/lib/nuit-cloud-agent"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	cmd, args := os.Args[1], os.Args[2:]
+	var err error
+	switch cmd {
+	case "enroll":
+		err = enroll(args)
+	case "run":
+		err = run(args)
+	case "status":
+		err = status(args)
+	case "survey":
+		err = surveyCmd()
+	case "version":
+		fmt.Println(version)
+	case "help", "-h", "--help":
+		usage()
+	default:
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "nuit-cloud-agent:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `nuit-cloud-agent `+version+`
+
+  enroll --url https://platform --code nce_... [--hostname name] [--state-dir dir] [--insecure-http]
+        Join the platform with an enrollment code from the admin portal. Run once, as root.
+  run [--state-dir dir] [--insecure-http]
+        Call the platform every 30 seconds and perform the tasks it signs. This is what the service runs.
+  status [--state-dir dir]
+        Show who this machine is on the platform (never the credential).
+  survey
+        Read this machine and print what the platform would be told. Changes nothing.
+  version
+`)
+}
+
+func stateDirFlag(fs *flag.FlagSet) *string {
+	def := os.Getenv("NUIT_CLOUD_AGENT_STATE_DIR")
+	if def == "" {
+		def = defaultStateDir
+	}
+	return fs.String("state-dir", def, "where the agent keeps its identity (readable by root only)")
+}
+
+func enroll(args []string) error {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	url := fs.String("url", os.Getenv("NUIT_CLOUD_PLATFORM_URL"), "the platform's address, https://...")
+	code := fs.String("code", os.Getenv("NUIT_CLOUD_ENROLLMENT_CODE"), "an enrollment code from the admin portal")
+	hostname := fs.String("hostname", "", "the name to enrol under (default: this machine's hostname)")
+	insecure := fs.Bool("insecure-http", false, "allow a plain http:// platform address (a trusted test network only)")
+	dir := stateDirFlag(fs)
+	_ = fs.Parse(args)
+	if *url == "" || *code == "" {
+		return fmt.Errorf("--url and --code are needed")
+	}
+	if _, err := state.Load(*dir); err == nil {
+		return fmt.Errorf("this machine is already enrolled (state in %s); remove that directory first to enrol again", *dir)
+	}
+	name := *hostname
+	if name == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		name = strings.ToLower(h)
+	}
+	c, err := client.New(*url, version, *insecure)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, err := c.Enroll(ctx, *code, name)
+	if err != nil {
+		return err
+	}
+	st := state.New(*dir)
+	st.PlatformURL, st.MachineID, st.Name, st.Credential = c.BaseURL, res.MachineID, res.Name, res.Credential
+	st.TrustedKeys, st.EnrolledAt = res.TaskSigning.Keys, time.Now().UTC()
+	if err := st.Save(); err != nil {
+		return fmt.Errorf("enrolled, but could not save the identity (the code is now used up): %w", err)
+	}
+	fmt.Printf("enrolled as %s (machine %s); it will check in every %d seconds\n", res.Name, res.MachineID, res.PollIntervalSeconds)
+	return nil
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	insecure := fs.Bool("insecure-http", false, "allow a plain http:// platform address (a trusted test network only)")
+	dir := stateDirFlag(fs)
+	_ = fs.Parse(args)
+	st, err := state.Load(*dir)
+	if err != nil {
+		return err
+	}
+	c, err := client.New(st.PlatformURL, version, *insecure)
+	if err != nil {
+		return err
+	}
+	c.Credential = st.Credential
+	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
+	l := &loop.Loop{
+		State:    st,
+		Platform: c,
+		Runner:   runner.Runner{Version: version, Survey: func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) }},
+		Log:      logger.Printf,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger.Printf("nuit-cloud-agent %s: %s (%s) calling %s", version, st.Name, st.MachineID, st.PlatformURL)
+	l.Run(ctx)
+	logger.Printf("stopping")
+	return nil
+}
+
+func status(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	dir := stateDirFlag(fs)
+	_ = fs.Parse(args)
+	st, err := state.Load(*dir)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(st.TrustedKeys))
+	for _, k := range st.TrustedKeys {
+		keys = append(keys, k.KeyID)
+	}
+	fmt.Printf("name:        %s\nmachine id:  %s\nplatform:    %s\nenrolled at: %s\ntrusted keys: %s\nagent:       %s\n", st.Name, st.MachineID, st.PlatformURL, st.EnrolledAt.Format(time.RFC3339), strings.Join(keys, ", "), version)
+	return nil
+}
+
+func surveyCmd() error {
+	out, err := json.MarshalIndent(survey.Collect(context.Background(), survey.Real()), "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
