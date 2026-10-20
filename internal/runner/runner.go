@@ -18,6 +18,7 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/sshconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
@@ -45,6 +46,8 @@ type Runner struct {
 	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
 	Runtime RuntimeStager
 	Updater SelfUpdater
+	// SSHConfirm completes the SSH hardening: re-checks what sshd uses and cancels the rollback timer; injectable for tests.
+	SSHConfirm func(ctx context.Context) (sshconfirm.Result, error)
 	// Scan asks which addresses of a private range answer on the machine's network; injectable for tests.
 	Scan func(ctx context.Context, first, last string) (lanscan.Result, error)
 	// Smoke runs the runtime's smoke test in a namespace and returns what it printed and its exit status; injectable for tests.
@@ -59,7 +62,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -92,6 +95,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.smoke(ctx, task)
 	case "address-scan":
 		return r.scan(ctx, task)
+	case "ssh-confirm":
+		return r.sshConfirm(ctx)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -120,6 +125,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable management address"}
 		}
 		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
+	}
+	if raw, ok := task.Params["ssh"].(map[string]any); ok {
+		fingerprints, err := sshFingerprints(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		env = append(env, "NCS_SSH_REQUIRE_FINGERPRINTS="+strings.Join(fingerprints, " "))
 	}
 	if raw, ok := task.Params["vlan"].(map[string]any); ok {
 		vlanEnv, err := vlanEnvironment(raw, r.PlatformURL)
@@ -331,4 +343,40 @@ func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 		tenants = append(tenants, a)
 	}
 	return []string{"NCS_VLAN_ID=" + id, "NCS_VLAN_PREFIX=" + prefix, "NCS_VLAN_ADDRESS=" + addr, "NCS_VLAN_GATEWAY=" + gateway, "NCS_VLAN_TENANT_ADDRESSES=" + strings.Join(tenants, " "), "NCS_PLATFORM_URL=" + platformURL}, nil
+}
+
+var sshFingerprint = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
+
+// sshFingerprints reads the keys the platform says must still be able to log in, refusing anything that is not a fingerprint.
+func sshFingerprints(raw map[string]any) ([]string, error) {
+	list, _ := raw["requireFingerprints"].([]any)
+	if len(list) < 1 || len(list) > 10 {
+		return nil, errors.New("the SSH task names 1 to 10 keys that must still be able to log in")
+	}
+	var out []string
+	for _, v := range list {
+		f, _ := v.(string)
+		if !sshFingerprint.MatchString(f) {
+			return nil, fmt.Errorf("%q is not a key fingerprint", f)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// sshConfirm completes the SSH hardening once the platform has tested sshd from outside.
+func (r Runner) sshConfirm(ctx context.Context) client.Report {
+	one, zero := 1, 0
+	run := r.SSHConfirm
+	if run == nil {
+		run = sshconfirm.Confirmer{Run: func(ctx context.Context, name string, args ...string) (string, error) {
+			out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+			return string(out), err
+		}}.Confirm
+	}
+	res, err := run(ctx)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error(), Result: res}
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: res.Note, Result: res}
 }

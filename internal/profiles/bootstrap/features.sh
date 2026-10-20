@@ -694,3 +694,75 @@ ROLLBACK
     echo "  $vif carries $NCS_VLAN_ADDRESS and the tenant block. Note: the VLAN gateway $NCS_VLAN_GATEWAY did not answer yet; the VLAN is assumed to reach this port, so this is left in place"
   fi
 }
+
+# ─── SSH hardening, with the platform in the check ──────────────────────────────────────────────────────────────────────────────
+# Writes /etc/ssh/sshd_config.d/00-nuit-cloud.conf (PermitRootLogin no, PasswordAuthentication no; the 00- makes it win, since sshd
+# keeps the first value it sees). This is the one change that can lock everyone out, so:
+#   * it refuses unless the login account's authorized_keys holds at least one of the keys the platform names
+#     (NCS_SSH_REQUIRE_FINGERPRINTS, SHA256 fingerprints), sshd accepts keys at all, sshd's configuration is valid and includes
+#     sshd_config.d, and the keys file is one sshd will honour (owned by the account, not group- or world-writable);
+#   * before anything changes a timer is armed (nuit-cloud-ssh-rollback) that takes the file away and reloads sshd;
+#   * after the reload it checks what sshd now uses and that it still listens, then leaves the timer ARMED: the platform tests sshd
+#     from outside (answers, offers a key and no password) and only then sends `ssh-confirm`, which cancels the timer. If the
+#     platform's test fails or never happens, passwords come back by themselves.
+SSH_DROPIN="${SSH_DROPIN:-/etc/ssh/sshd_config.d/00-nuit-cloud.conf}"
+SSH_CONFIRM_SECONDS="${NCS_SSH_CONFIRM_SECONDS:-600}"
+
+f_ncs_ssh_harden_ok() { f_ncs_ssh_ok; }
+
+ssh_reload() { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; }
+
+f_ncs_ssh_harden_do() {
+  required="${NCS_SSH_REQUIRE_FINGERPRINTS:-}"
+  [ -n "$required" ] || { echo "  the platform named no administrator key that must still be able to log in: apply this profile from the portal" >&2; return 3; }
+  for f in $required; do printf '%s' "$f" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || { echo "  '$f' is not a key fingerprint (SHA256:…)" >&2; return 3; }; done
+  command -v sshd >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 && command -v systemd-run >/dev/null 2>&1 || { echo "  sshd, ssh-keygen and systemd-run are needed" >&2; return 3; }
+  sshd -t 2>/dev/null || { echo "  sshd's configuration is not valid as it stands: nothing was changed" >&2; return 3; }
+  grep -Eqi '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$(p /etc/ssh/sshd_config)" 2>/dev/null \
+    || { echo "  /etc/ssh/sshd_config does not include sshd_config.d/*.conf, so the override would do nothing: edit it by hand" >&2; return 3; }
+  [ "$(sshd_effective pubkeyauthentication)" = yes ] || { echo "  sshd does not accept keys (PubkeyAuthentication is not yes): turning passwords off would lock everyone out" >&2; return 3; }
+
+  home="$(getent passwd "$NC_USER" 2>/dev/null | cut -d: -f6)"
+  [ -n "$home" ] || { echo "  there is no account $NC_USER" >&2; return 3; }
+  keys="$home/.ssh/authorized_keys"
+  case "$(sshd_effective authorizedkeysfile)" in *.ssh/authorized_keys*) ;; *) echo "  sshd reads keys from somewhere other than .ssh/authorized_keys: set it up by hand" >&2; return 3 ;; esac
+  [ -s "$keys" ] || { echo "  $keys is missing or empty: $NC_USER has no key to log in with" >&2; return 3; }
+  owner="$(stat -c %U "$keys" 2>/dev/null || stat -f %Su "$keys" 2>/dev/null)"
+  [ "$owner" = "$NC_USER" ] || [ "$owner" = root ] || { echo "  $keys is owned by $owner, so sshd ignores it" >&2; return 3; }
+  [ -z "$(find "$keys" \( -perm -020 -o -perm -002 \) 2>/dev/null)" ] || { echo "  $keys is writable by others, so sshd ignores it" >&2; return 3; }
+  have="$(ssh-keygen -lf "$keys" 2>/dev/null | awk '{print $2}')"
+  found=0; for f in $required; do printf '%s\n' "$have" | grep -qx "$f" && found=1; done
+  [ "$found" = 1 ] || { echo "  none of the keys the platform expects ($required) is in $keys: add one before passwords are turned off" >&2; return 3; }
+
+  d="$(p "$ADDR_DIR")/ssh"; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
+  dropin="$(p "$SSH_DROPIN")"; existing=0
+  [ -f "$dropin" ] && { cp -p "$dropin" "$d/previous"; existing=1; }
+  cat >"$d/rollback.sh" <<ROLLBACK
+#!/bin/sh
+# Put SSH back as it was before it was hardened. Run by the safety timer, or at once if the change could not be proved to work.
+PATH="\$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+echo "nuit-cloud: undoing the SSH hardening"
+if [ "$existing" = 1 ]; then cp -p "$d/previous" "$dropin"; else rm -f "$dropin"; fi
+sshd -t && { systemctl reload ssh || systemctl reload sshd; }
+rm -f "$d/armed"
+exit 0
+ROLLBACK
+  chmod 700 "$d/rollback.sh"
+  systemd-run --quiet --unit=nuit-cloud-ssh-rollback --collect --on-active="${SSH_CONFIRM_SECONDS}s" /bin/sh "$d/rollback.sh" || { echo "  could not arm the safety timer; nothing was changed" >&2; return 1; }
+  : >"$d/armed"
+
+  mkdir -p "$(dirname "$dropin")"
+  printf '# Written by the nuit-cloud agent: SSH is for keys only. The 00- prefix makes these win over later files.\nPermitRootLogin no\nPasswordAuthentication no\n' >"$dropin"
+  if ! sshd -t 2>"$d/sshd-t.out"; then
+    sh "$d/rollback.sh"; echo "  sshd rejected the new configuration ($(tr '\n' ' ' <"$d/sshd-t.out" | cut -c1-160)), so it was taken away" >&2; return 1
+  fi
+  ssh_reload || { sh "$d/rollback.sh"; echo "  sshd could not be reloaded, so the change was taken away" >&2; return 1; }
+  sleep 2
+  root="$(sshd_effective permitrootlogin)"; pass="$(sshd_effective passwordauthentication)"
+  if [ "$root" = yes ] || [ "$pass" != no ]; then
+    sh "$d/rollback.sh"; echo "  sshd still uses PermitRootLogin $root / PasswordAuthentication $pass (another file wins?), so the change was taken away" >&2; return 1
+  fi
+  port="$(sshd_effective port)"; port="${port:-22}"
+  ss -ltnH 2>/dev/null | awk '{print $4}' | grep -q ":$port\$" || { sh "$d/rollback.sh"; echo "  sshd is not listening on port $port after the reload, so the change was taken away" >&2; return 1; }
+  echo "  SSH now refuses passwords and root login (sshd uses PermitRootLogin $root, PasswordAuthentication $pass). Waiting for the platform to test sshd from outside and confirm within ${SSH_CONFIRM_SECONDS}s; otherwise passwords come back."
+}

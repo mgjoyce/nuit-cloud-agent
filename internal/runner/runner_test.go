@@ -11,6 +11,7 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/sshconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
@@ -403,5 +404,38 @@ func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *test
 		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
 			t.Errorf("%s: %+v calls=%v", name, rep, f2.calls)
 		}
+	}
+}
+
+func TestTheKeysThePlatformNamesReachTheScriptsAndBadOnesAreRefused(t *testing.T) {
+	fp := "SHA256:" + strings.Repeat("A", 43)
+	f := &fakeProfiles{}
+	r := withProfiles(f)
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-ssh", "ssh": map[string]any{"requireFingerprints": []any{fp, "SHA256:" + strings.Repeat("b", 43)}}}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || len(f.env) != 1 || f.env[0] != "NCS_SSH_REQUIRE_FINGERPRINTS="+fp+" SHA256:"+strings.Repeat("b", 43) {
+		t.Errorf("%+v env=%v", rep, f.env)
+	}
+	for _, bad := range []any{[]any{}, []any{"nope"}, []any{fp + "; reboot"}, "SHA256:x"} {
+		f2 := &fakeProfiles{}
+		task.Params["ssh"] = map[string]any{"requireFingerprints": bad}
+		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
+			t.Errorf("%v: %+v calls=%v", bad, rep, f2.calls)
+		}
+	}
+}
+
+func TestSSHConfirmReportsWhatTheConfirmerSaid(t *testing.T) {
+	r := newRunner()
+	r.SSHConfirm = func(context.Context) (sshconfirm.Result, error) {
+		return sshconfirm.Result{Armed: true, Confirmed: true, Note: "SSH is hardened and the rollback is cancelled"}, nil
+	}
+	if rep := r.Run(context.Background(), &taskverify.Task{Name: "ssh-confirm", TimeoutSeconds: 30}); rep.Status != "done" || rep.Output != "SSH is hardened and the rollback is cancelled" {
+		t.Errorf("%+v", rep)
+	}
+	r.SSHConfirm = func(context.Context) (sshconfirm.Result, error) {
+		return sshconfirm.Result{Armed: true}, errors.New("sshd does not use the hardened settings")
+	}
+	if rep := r.Run(context.Background(), &taskverify.Task{Name: "ssh-confirm", TimeoutSeconds: 30}); rep.Status != "failed" {
+		t.Errorf("%+v", rep)
 	}
 }

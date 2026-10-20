@@ -97,7 +97,7 @@ func TestNamesListsTheProfilesCarried(t *testing.T) {
 
 func TestTheRealEmbeddedProfilesAreTheOnesThePlatformAsksFor(t *testing.T) {
 	got := Runner{}.Names()
-	if !reflect.DeepEqual(got, []string{"nuit-cloud-address", "nuit-cloud-server", "nuit-cloud-vlan", "nuit-container-service"}) {
+	if !reflect.DeepEqual(got, []string{"nuit-cloud-address", "nuit-cloud-server", "nuit-cloud-ssh", "nuit-cloud-vlan", "nuit-container-service"}) {
 		t.Errorf("embedded profiles: %v (run `make sync-bootstrap`)", got)
 	}
 }
