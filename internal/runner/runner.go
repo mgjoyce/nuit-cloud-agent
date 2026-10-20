@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -38,6 +39,8 @@ type Runner struct {
 	// Survey reads the machine; injectable so tests need no real machine.
 	Survey   func(ctx context.Context) survey.Report
 	Profiles ProfileRunner
+	// PlatformURL is the platform's address, handed to the network feature as the thing it must still reach from the new address.
+	PlatformURL string
 	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
 	Runtime RuntimeStager
 	Updater SelfUpdater
@@ -106,6 +109,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 	}
 	apply := task.Name == "profile-apply"
 	var env []string
+	if raw, ok := task.Params["network"].(map[string]any); ok {
+		addr, _ := raw["managementAddress"].(string)
+		if !ipv4.MatchString(addr) || net.ParseIP(addr) == nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable management address"}
+		}
+		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
+	}
 	if raw, ok := task.Params["runtime"].(map[string]any); ok && apply {
 		if r.Runtime == nil {
 			return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot install the runtime"}
@@ -119,10 +129,10 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 			return client.Report{Status: "failed", ExitCode: &one, Output: "could not stage the runtime: " + err.Error()}
 		}
 		defer cleanup()
-		env = staged
+		env = append(env, staged...)
 	} else if ok {
 		// a check needs no files: it only asks whether what is installed is healthy
-		env = []string{"NCS_RUNTIME_BUNDLE_SHA256=" + stringParam(raw, "bundleSha256")}
+		env = append(env, "NCS_RUNTIME_BUNDLE_SHA256="+stringParam(raw, "bundleSha256"))
 	}
 	res, exit, err := r.Profiles.Run(ctx, name, apply, env...)
 	if err != nil {
@@ -202,6 +212,8 @@ func (r Runner) selfUpdate(ctx context.Context, task *taskverify.Task) client.Re
 	}
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("updated from %s to %s; restarting to start the new version", outcome.From, outcome.To), Result: outcome}
 }
+
+var ipv4 = regexp.MustCompile(`^([0-9]{1,3}\.){3}[0-9]{1,3}$`)
 
 var smokeNamespace = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 

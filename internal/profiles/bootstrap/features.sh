@@ -327,3 +327,158 @@ f_ncs_volumes_do() {
   systemctl daemon-reload 2>/dev/null || true
   mount "$VOLUMES_DIR"
 }
+
+# ─── The management address the platform allocated (ticket #67) ──────────────────────────────────────────────────────────────
+# Turns the machine's DHCP address into the static one the platform allocated for it. This can cut a machine off from the platform,
+# so it is built to be undone without anyone's help:
+#   * a systemd timer that restores the old configuration is armed BEFORE anything changes, and cancelled only once the machine has
+#     reached the platform from the new address; if the agent, the network or the machine dies in between, the timer still fires;
+#   * the change is additive while it is tried: the new address is added beside the old one, and the old one is removed only after
+#     that works; the interface is never taken down (VLANs and containers on it stay up);
+#   * only ifupdown (Debian's default) is handled; NetworkManager, systemd-networkd or an address in another subnet are reported
+#     MANUAL and left alone.
+# The agent passes NCS_MANAGEMENT_ADDRESS (from the signed task) and NCS_PLATFORM_URL (what to reach to prove it works).
+ADDR_DIR="${ADDR_DIR:-/var/lib/nuit-cloud-agent/address}"
+ADDR_ROLLBACK_SECONDS="${ADDR_ROLLBACK_SECONDS:-180}"
+ADDR_STATIC_FILE="/etc/network/interfaces.d/nuit-cloud-address"
+
+addr_is_ipv4() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && ! printf '%s' "$1" | grep -Eq '(^|\.)(25[6-9]|2[6-9][0-9]|[3-9][0-9][0-9])(\.|$)'; }
+
+# The interface and gateway of the default route, and the machine's own address on it (set A_IF, A_GW, A_CUR, A_PREFIX).
+addr_discover() {
+  A_IF="$(ip -4 route show default 2>/dev/null | awk '/^default/ {for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+  A_GW="$(ip -4 route show default 2>/dev/null | awk '/^default/ {for (i = 1; i < NF; i++) if ($i == "via") {print $(i + 1); exit}}')"
+  A_CUR=""; A_PREFIX=""
+  [ -n "$A_IF" ] || return 1
+  cur="$(ip -4 -o addr show dev "$A_IF" scope global 2>/dev/null | awk '{print $4; exit}')"
+  A_CUR="${cur%/*}"; A_PREFIX="${cur#*/}"
+}
+
+# The ifupdown files that define <interface> (the main file and interfaces.d/*).
+addr_files_for() {
+  for f in "$(p /etc/network/interfaces)" "$(p /etc/network/interfaces.d)"/*; do
+    [ -f "$f" ] && grep -Eq "^[[:space:]]*iface[[:space:]]+$1[[:space:]]" "$f" && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+f_ncs_address_ok() {
+  [ -n "${NCS_MANAGEMENT_ADDRESS:-}" ] && addr_discover || return 1
+  ip -4 -o addr show dev "$A_IF" 2>/dev/null | awk '{print $4}' | grep -qx "$NCS_MANAGEMENT_ADDRESS/$A_PREFIX" || return 1
+  grep -Eq "^[[:space:]]*address[[:space:]]+$NCS_MANAGEMENT_ADDRESS/" "$(p "$ADDR_STATIC_FILE")" 2>/dev/null || return 1
+  for f in $(addr_files_for "$A_IF"); do
+    [ "$f" = "$(p "$ADDR_STATIC_FILE")" ] && continue
+    ! grep -Eq "^[[:space:]]*iface[[:space:]]+$A_IF[[:space:]]+inet[[:space:]]+dhcp" "$f" || return 1
+  done
+  return 0
+}
+
+# Comment out the stanza that defines <interface> (inet) in <file>, keeping every other line. A stanza ends at the next line
+# that begins a new one (auto, allow-*, iface, mapping, source, no-*) or at a line with no indentation that is not a comment.
+addr_neutralise() { # addr_neutralise <file> <interface>
+  awk -v ifc="$2" '
+    /^[[:space:]]*iface[[:space:]]+/ { in_stanza = ($2 == ifc && $3 == "inet") }
+    /^(auto|allow-[a-z]+|mapping|source|source-directory|no-auto-down|no-scripts)([[:space:]]|$)/ { in_stanza = 0 }
+    { if (in_stanza && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/) print "# nuit-cloud: " $0; else print }
+  ' "$1"
+}
+
+f_ncs_address_do() {
+  target="${NCS_MANAGEMENT_ADDRESS:-}"
+  [ -n "$target" ] || { echo "  no management address was given: allocate one in the portal, then apply this profile from there" >&2; return 3; }
+  addr_is_ipv4 "$target" || { echo "  $target is not an IPv4 address" >&2; return 3; }
+  command -v ifup >/dev/null 2>&1 && [ -f "$(p /etc/network/interfaces)" ] || { echo "  this machine does not use ifupdown (no /etc/network/interfaces): set $target by hand" >&2; return 3; }
+  for m in NetworkManager systemd-networkd; do
+    ! systemctl is-active --quiet "$m" 2>/dev/null || { echo "  $m manages the network here; this feature only handles ifupdown: set $target by hand" >&2; return 3; }
+  done
+  command -v systemd-run >/dev/null 2>&1 || { echo "  systemd-run is needed for the safety timer; set $target by hand" >&2; return 3; }
+  addr_discover && [ -n "$A_GW" ] && [ -n "$A_CUR" ] || { echo "  could not find the default route and the address on it" >&2; return 3; }
+  addr_is_ipv4 "$A_CUR" && addr_is_ipv4 "$A_GW" || { echo "  the default route is not plain IPv4" >&2; return 3; }
+  # same subnet only: another subnet changes the gateway and routes, which a person should see
+  net_of() { awk -v ip="$1" -v pl="$2" 'BEGIN {split(ip, o, "."); v = ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]; b = 2 ^ (32 - pl); print int(v / b)}'; }
+  [ "$(net_of "$target" "$A_PREFIX")" = "$(net_of "$A_CUR" "$A_PREFIX")" ] || { echo "  $target is not in the machine's current subnet ($A_CUR/$A_PREFIX): change subnets by hand" >&2; return 3; }
+  [ "$target" != "$A_GW" ] || { echo "  $target is the gateway's own address" >&2; return 3; }
+  files="$(addr_files_for "$A_IF")"
+  [ -n "$files" ] || { echo "  $A_IF is not defined in /etc/network/interfaces: it is configured some other way; set $target by hand" >&2; return 3; }
+  printf '%s\n' "$files" | grep -q "$ADDR_STATIC_FILE\$" && files="$(printf '%s\n' "$files" | grep -v "$ADDR_STATIC_FILE\$")"
+  printf '%s\n' "$A_IF" | grep -Eq '^[a-zA-Z0-9._-]{1,15}$' || { echo "  odd interface name $A_IF" >&2; return 3; }
+
+  added=0
+  if [ "$A_CUR" != "$target" ]; then
+    # somebody else may already answer for it
+    command -v arping >/dev/null 2>&1 || { apt-get install -y -qq iputils-arping >/dev/null 2>&1 || true; }
+    if command -v arping >/dev/null 2>&1; then
+      arping -D -q -c 2 -w 3 -I "$A_IF" "$target" >/dev/null 2>&1 || { echo "  another device already answers for $target on the network: nothing was changed" >&2; return 1; }
+    fi
+    added=1
+  fi
+
+  # backups, then the timer that undoes everything
+  d="$(p "$ADDR_DIR")"; rm -rf "$d/backup"; mkdir -p "$d/backup"; chmod 700 "$d"
+  : >"$d/backup/files"
+  for f in $files; do cp -p "$f" "$d/backup/$(printf '%s' "$f" | tr '/' '_')" && printf '%s\n' "$f" >>"$d/backup/files"; done
+  dhcp_was=0; for f in $files; do grep -Eq "^[[:space:]]*iface[[:space:]]+$A_IF[[:space:]]+inet[[:space:]]+dhcp" "$f" && dhcp_was=1; done
+  cat >"$d/rollback.sh" <<ROLLBACK
+#!/bin/sh
+# Put the machine's network back as it was before the management address was applied. Run by the safety timer, or at once if the
+# change could not be proved to work. Written by the nuit-cloud agent's ncs_address feature.
+PATH="\$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+echo "nuit-cloud: undoing the management address change"
+while IFS= read -r f; do cp -p "$d/backup/\$(printf '%s' "\$f" | tr '/' '_')" "\$f"; done <"$d/backup/files"
+rm -f "$(p "$ADDR_STATIC_FILE")"
+ip addr add $A_CUR/$A_PREFIX dev $A_IF 2>/dev/null
+[ "$added" = 1 ] && ip addr del $target/$A_PREFIX dev $A_IF 2>/dev/null
+ip route replace default via $A_GW dev $A_IF 2>/dev/null
+[ "$dhcp_was" = 1 ] && ifup --force $A_IF 2>/dev/null
+rm -f "$d/armed"
+exit 0
+ROLLBACK
+  chmod 700 "$d/rollback.sh"
+  systemd-run --quiet --unit=nuit-cloud-address-rollback --collect --on-active="${ADDR_ROLLBACK_SECONDS}s" /bin/sh "$d/rollback.sh" || { echo "  could not arm the safety timer; nothing was changed" >&2; return 1; }
+  : >"$d/armed"
+
+  # 1. live, additive: the new address beside the old one
+  if [ "$added" = 1 ]; then
+    sysctl -q -w "net.ipv4.conf.$A_IF.promote_secondaries=1" >/dev/null 2>&1 || true
+    ip addr add "$target/$A_PREFIX" dev "$A_IF" || { sh "$d/rollback.sh"; echo "  could not add $target to $A_IF" >&2; return 1; }
+  fi
+  # 2. persistent: the DHCP stanza out, the static one in
+  for f in $files; do
+    addr_neutralise "$f" "$A_IF" >"$f.nuit-new" && mv "$f.nuit-new" "$f" || { sh "$d/rollback.sh"; echo "  could not rewrite $f" >&2; return 1; }
+  done
+  mkdir -p "$(dirname "$(p "$ADDR_STATIC_FILE")")"
+  cat >"$(p "$ADDR_STATIC_FILE")" <<STATIC
+# Written by the nuit-cloud agent: the management address the platform allocated for this machine. The previous configuration is
+# commented out where it was, and kept in $ADDR_DIR/backup.
+iface $A_IF inet static
+    address $target/$A_PREFIX
+    gateway $A_GW
+STATIC
+  # 3. the DHCP client stops, so it does not take the address back or rewrite the routes (the address stays on the interface)
+  for pf in "/run/dhclient.$A_IF.pid" "/run/dhcpcd/$A_IF.pid" "/run/udhcpc.$A_IF.pid"; do
+    [ -f "$(p "$pf")" ] && kill "$(cat "$(p "$pf")")" 2>/dev/null || true
+  done
+  ip -4 -o addr show dev "$A_IF" 2>/dev/null | awk '{print $4}' | grep -qx "$target/$A_PREFIX" || ip addr add "$target/$A_PREFIX" dev "$A_IF" 2>/dev/null || true
+  ip route replace default via "$A_GW" dev "$A_IF" 2>/dev/null || true
+  # 4. the old address goes, only now
+  if [ "$added" = 1 ]; then ip addr del "$A_CUR/$A_PREFIX" dev "$A_IF" 2>/dev/null || true; fi
+
+  # 5. proof: the platform must be reachable from the new address
+  proved=0
+  if [ -n "${NCS_PLATFORM_URL:-}" ]; then
+    for _ in 1 2 3 4 5 6; do
+      if curl -fsS --max-time 15 --interface "$target" -o /dev/null "$NCS_PLATFORM_URL/api/agent/download/VERSION" 2>/dev/null; then proved=1; break; fi
+      sleep 5
+    done
+  else
+    ping -c 2 -W 3 -I "$target" "$A_GW" >/dev/null 2>&1 && proved=1
+  fi
+  if [ "$proved" != 1 ]; then
+    sh "$d/rollback.sh"
+    echo "  the platform could not be reached from $target, so the old configuration was put back" >&2
+    return 1
+  fi
+  systemctl stop nuit-cloud-address-rollback.timer >/dev/null 2>&1 || true
+  rm -f "$d/armed"
+  echo "  $A_IF now uses $target/$A_PREFIX as a static address (was $A_CUR; the old configuration is in $ADDR_DIR/backup)"
+}

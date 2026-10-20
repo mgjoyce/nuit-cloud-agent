@@ -336,3 +336,21 @@ func TestTheSmokeTestRefusesAnOddNamespaceAndReportsAMissingScript(t *testing.T)
 		t.Errorf("%+v", rep)
 	}
 }
+
+func TestTheManagementAddressReachesTheScriptsAsEnvironment(t *testing.T) {
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_address", Status: "applied"}}}}
+	r := withProfiles(f)
+	r.PlatformURL = "https://agent.example"
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-address", "network": map[string]any{"managementAddress": "10.10.10.162"}}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || len(f.env) != 2 || f.env[0] != "NCS_MANAGEMENT_ADDRESS=10.10.10.162" || f.env[1] != "NCS_PLATFORM_URL=https://agent.example" {
+		t.Errorf("%+v env=%v", rep, f.env)
+	}
+	for _, bad := range []string{"", "10.10.10.999", "10.10.10.1; reboot", "fe80::1", "$(id)"} {
+		f2 := &fakeProfiles{}
+		r2 := withProfiles(f2)
+		task.Params["network"] = map[string]any{"managementAddress": bad}
+		if rep := r2.Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
+			t.Errorf("%q: %+v calls=%v", bad, rep, f2.calls)
+		}
+	}
+}
