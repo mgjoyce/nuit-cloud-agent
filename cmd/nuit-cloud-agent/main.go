@@ -78,6 +78,12 @@ func usage() {
 `)
 }
 
+// insecureFlag is --insecure-http, which can also be set for the whole service with NUIT_CLOUD_AGENT_INSECURE_HTTP=1 (so a
+// unit file for a trusted test network needs no edit to its command).
+func insecureFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("insecure-http", os.Getenv("NUIT_CLOUD_AGENT_INSECURE_HTTP") == "1", "allow a plain http:// platform address (a trusted test network only)")
+}
+
 func stateDirFlag(fs *flag.FlagSet) *string {
 	def := os.Getenv("NUIT_CLOUD_AGENT_STATE_DIR")
 	if def == "" {
@@ -91,7 +97,7 @@ func enroll(args []string) error {
 	url := fs.String("url", os.Getenv("NUIT_CLOUD_PLATFORM_URL"), "the platform's address, https://...")
 	code := fs.String("code", os.Getenv("NUIT_CLOUD_ENROLLMENT_CODE"), "an enrollment code from the admin portal")
 	hostname := fs.String("hostname", "", "the name to enrol under (default: this machine's hostname)")
-	insecure := fs.Bool("insecure-http", false, "allow a plain http:// platform address (a trusted test network only)")
+	insecure := insecureFlag(fs)
 	dir := stateDirFlag(fs)
 	_ = fs.Parse(args)
 	if *url == "" || *code == "" {
@@ -130,7 +136,7 @@ func enroll(args []string) error {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	insecure := fs.Bool("insecure-http", false, "allow a plain http:// platform address (a trusted test network only)")
+	insecure := insecureFlag(fs)
 	dir := stateDirFlag(fs)
 	_ = fs.Parse(args)
 	st, err := state.Load(*dir)

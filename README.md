@@ -25,6 +25,30 @@ nuit-cloud-agent survey     # read this machine and print what the platform woul
 
 The agent keeps its identity in `/var/lib/nuit-cloud-agent/state.json` (mode 0600, root only), written atomically.
 
+## Installing on a machine by hand
+
+Until the one-command installer exists (it needs an https address for the platform and published, signed releases). On the machine, as root (`su -`):
+
+```
+# 1. the binary for the machine's CPU (uname -m: x86_64 = amd64, aarch64 = arm64), copied over, for example with scp
+install -m 0755 nuit-cloud-agent-linux-amd64 /usr/local/bin/nuit-cloud-agent
+
+# 2. the service
+install -m 0644 nuit-cloud-agent.service /etc/systemd/system/nuit-cloud-agent.service
+
+# 3. enrol with a code from the admin portal (Platform tenant > Nuit Cloud Servers > Enrollment codes).
+#    The portal shows this exact command. --insecure-http is needed only while the platform has no https address.
+nuit-cloud-agent enroll --url http://<platform address>:4173 --code nce_... --insecure-http
+
+# 4. start it. On a plain-http test network the service needs the same allowance:
+mkdir -p /etc/systemd/system/nuit-cloud-agent.service.d
+printf '[Service]\nEnvironment=NUIT_CLOUD_AGENT_INSECURE_HTTP=1\n' > /etc/systemd/system/nuit-cloud-agent.service.d/insecure-http.conf
+systemctl daemon-reload && systemctl enable --now nuit-cloud-agent
+journalctl -u nuit-cloud-agent -f      # it should say it is calling the platform
+```
+
+The machine appears in the portal as soon as it enrols. Then run **Survey now** on its page.
+
 ## Development
 
 ```
@@ -36,4 +60,4 @@ make build     # static binaries in dist/ (VERSION=1.2.3 to set the version)
 
 ## Status
 
-First version (0.1.0). Not yet built: self-update, the `profile-check` / `profile-apply` tasks (they answer "not supported by this version"), release signing, and automatic credential rotation. See the tickets in the platform repository under the epic "Commission a Nuit Cloud Server from the admin portal".
+Version 0.2.x. Built: enrolment, check-in, signed-task verification, `ping`, `survey`, `profile-check`, `profile-apply`. Not yet built: self-update, signed releases, and automatic credential rotation. See the tickets in the platform repository under the epic "Commission a Nuit Cloud Server from the admin portal".
