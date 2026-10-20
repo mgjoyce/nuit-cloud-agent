@@ -30,9 +30,22 @@ type State struct {
 	EnrolledAt  time.Time        `json:"enrolledAt"`
 	// Seen maps a task id to when the agent started it.
 	Seen map[string]time.Time `json:"seen"`
+	// PendingUpdate is set while a freshly installed version has not yet proved itself by checking in (see package update).
+	PendingUpdate *PendingUpdate `json:"pendingUpdate,omitempty"`
 
 	mu  sync.Mutex
 	dir string
+}
+
+// PendingUpdate records an update that has been installed but not yet confirmed.
+type PendingUpdate struct {
+	From string    `json:"from"`
+	To   string    `json:"to"`
+	At   time.Time `json:"at"`
+	// Attempts counts how many times the new version has started without being confirmed.
+	Attempts int `json:"attempts"`
+	// Previous is where the binary that was replaced is kept, to go back to.
+	Previous string `json:"previous"`
 }
 
 // ErrNotEnrolled is returned by Load when there is no state yet.
@@ -136,4 +149,45 @@ func (s *State) SetCredential(credential string) error {
 	defer s.mu.Unlock()
 	s.Credential = credential
 	return s.saveLocked()
+}
+
+// Pending returns a copy of the pending update, or nil.
+func (s *State) Pending() *PendingUpdate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PendingUpdate == nil {
+		return nil
+	}
+	p := *s.PendingUpdate
+	return &p
+}
+
+// SetPending records an installed, unconfirmed update and saves it at once.
+func (s *State) SetPending(p PendingUpdate) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.PendingUpdate = &p
+	return s.saveLocked()
+}
+
+// ClearPending forgets the pending update (it was confirmed, rolled back, or is no longer relevant).
+func (s *State) ClearPending() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PendingUpdate == nil {
+		return nil
+	}
+	s.PendingUpdate = nil
+	return s.saveLocked()
+}
+
+// BumpPendingAttempts counts one more start of the unconfirmed version and returns the new count (0 if nothing is pending).
+func (s *State) BumpPendingAttempts() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PendingUpdate == nil {
+		return 0, nil
+	}
+	s.PendingUpdate.Attempts++
+	return s.PendingUpdate.Attempts, s.saveLocked()
 }

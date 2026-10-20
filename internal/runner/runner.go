@@ -5,17 +5,24 @@ package runner
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
 )
 
 // ProfileRunner checks or applies a profile (profiles.Runner; injectable so tests touch no real system).
 type ProfileRunner interface {
 	Run(ctx context.Context, profile string, apply bool) (profiles.Result, int, error)
+}
+
+// SelfUpdater replaces the running agent with a newer build (update.Updater; injectable so tests touch no real binary).
+type SelfUpdater interface {
+	Apply(ctx context.Context, p update.Params) (update.Outcome, error)
 }
 
 // Runner performs verified tasks.
@@ -25,12 +32,18 @@ type Runner struct {
 	// Survey reads the machine; injectable so tests need no real machine.
 	Survey   func(ctx context.Context) survey.Report
 	Profiles ProfileRunner
-	Now      func() time.Time
+	Updater  SelfUpdater
+	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
+	Restart *atomic.Bool
+	Now     func() time.Time
 }
+
+// RestartRequested reports whether the agent must restart to finish what a task did.
+func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.Load() }
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -57,6 +70,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return client.Report{Status: "done", ExitCode: &zero, Output: "surveyed", Result: r.Survey(ctx)}
 	case "profile-check", "profile-apply":
 		return r.profile(ctx, task)
+	case "update-agent":
+		return r.selfUpdate(ctx, task)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -124,4 +139,28 @@ func joinNames(names []string) string {
 		out += n
 	}
 	return out
+}
+
+// selfUpdate installs the build the (signed) task names. When it replaces the binary it asks to be restarted, which the loop
+// does after the result has been reported, so the platform hears of it before the agent goes away.
+func (r Runner) selfUpdate(ctx context.Context, task *taskverify.Task) client.Report {
+	one, zero := 1, 0
+	if r.Updater == nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot update itself"}
+	}
+	params, err := update.ParseParams(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	outcome, err := r.Updater.Apply(ctx, params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	if !outcome.Changed {
+		return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("already at %s", outcome.To), Result: outcome}
+	}
+	if r.Restart != nil {
+		r.Restart.Store(true)
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("updated from %s to %s; restarting to start the new version", outcome.From, outcome.To), Result: outcome}
 }

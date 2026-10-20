@@ -346,3 +346,130 @@ func (longOutputRunner) Names() []string { return []string{"ping"} }
 func (longOutputRunner) Run(context.Context, *taskverify.Task) client.Report {
 	return client.Report{Status: "done", Output: string(make([]byte, 500*1024))}
 }
+
+type fakeGuard struct {
+	mu          sync.Mutex
+	started     bool
+	overdue     bool
+	confirmed   int
+	rolledBack  int
+	rollbackErr error
+}
+
+func (g *fakeGuard) Started() bool { g.mu.Lock(); defer g.mu.Unlock(); return g.started }
+func (g *fakeGuard) Confirm()      { g.mu.Lock(); g.confirmed++; g.mu.Unlock() }
+func (g *fakeGuard) Overdue(time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.overdue
+}
+func (g *fakeGuard) Rollback() error {
+	g.mu.Lock()
+	g.rolledBack++
+	g.mu.Unlock()
+	return g.rollbackErr
+}
+
+// updatingRunner stands in for a runner whose task replaced the agent's own binary.
+type updatingRunner struct{ fakeRunner }
+
+func (u *updatingRunner) RestartRequested() bool { return true }
+
+func TestASuccessfulCheckInConfirmsANewVersion(t *testing.T) {
+	l, _, _, _ := setup(t)
+	g := &fakeGuard{}
+	l.Guard = g
+	if _, err := l.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if g.confirmed != 1 {
+		t.Errorf("confirmed %d times", g.confirmed)
+	}
+}
+
+func TestAFailedCheckInDoesNotConfirmAnything(t *testing.T) {
+	l, p, _, _ := setup(t)
+	g := &fakeGuard{}
+	l.Guard = g
+	p.checkIn = errors.New("network down")
+	_, _ = l.Once(context.Background())
+	if g.confirmed != 0 {
+		t.Error("only a successful check-in proves a new version")
+	}
+}
+
+func TestATaskThatUpdatedTheAgentIsReportedFirstAndThenTheAgentRestarts(t *testing.T) {
+	l, p, _, v := setup(t)
+	r := &updatingRunner{}
+	l.Runner = r
+	restarted := make(chan struct{}, 1)
+	l.Restart = func() { restarted <- struct{}{} }
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	_, _ = l.Once(context.Background())
+	l.Wait()
+	select {
+	case <-restarted:
+	default:
+		t.Fatal("the agent must restart after an update")
+	}
+	if got := p.statuses(pingID); len(got) != 2 || got[1] != "done" {
+		t.Errorf("the result must be reported before the restart: %v", got)
+	}
+}
+
+func TestAPlainTaskDoesNotRestartTheAgent(t *testing.T) {
+	l, p, _, v := setup(t)
+	restarted := false
+	l.Restart = func() { restarted = true }
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	_, _ = l.Once(context.Background())
+	l.Wait()
+	if restarted {
+		t.Error("only a task that changed the agent restarts it")
+	}
+}
+
+func TestAVersionThatKeepsRestartingIsRolledBackAtStartup(t *testing.T) {
+	l, _, _, _ := setup(t)
+	g := &fakeGuard{started: true}
+	l.Guard = g
+	restarted := false
+	l.Restart = func() { restarted = true }
+	ctx, cancel := context.WithCancel(context.Background())
+	l.Sleep = func(context.Context, time.Duration) { cancel() }
+	l.Run(ctx)
+	if g.rolledBack != 1 || !restarted {
+		t.Errorf("rolledBack=%d restarted=%v", g.rolledBack, restarted)
+	}
+}
+
+func TestAVersionThatCannotCheckInInTimeIsRolledBackAndTheLoopStops(t *testing.T) {
+	l, p, _, _ := setup(t)
+	g := &fakeGuard{overdue: true}
+	l.Guard = g
+	p.checkIn = errors.New("cannot reach the platform")
+	restarted := false
+	l.Restart = func() { restarted = true }
+	done := make(chan struct{})
+	go func() { l.Run(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop must stop so the old build can start")
+	}
+	if g.rolledBack != 1 || !restarted || g.confirmed != 0 {
+		t.Errorf("rolledBack=%d restarted=%v confirmed=%d", g.rolledBack, restarted, g.confirmed)
+	}
+}
+
+func TestARollbackThatFailsStillStopsTheLoop(t *testing.T) {
+	l, _, _, _ := setup(t)
+	g := &fakeGuard{overdue: true, rollbackErr: errors.New("no previous build")}
+	l.Guard = g
+	restarted := false
+	l.Restart = func() { restarted = true }
+	l.Run(context.Background())
+	if g.rolledBack != 1 || !restarted {
+		t.Errorf("rolledBack=%d restarted=%v", g.rolledBack, restarted)
+	}
+}

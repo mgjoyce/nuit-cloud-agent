@@ -34,6 +34,18 @@ const (
 	reportAttempts = 5
 )
 
+// Guard watches a freshly installed version (update.Guard).
+type Guard interface {
+	// Started is called once when the agent starts; true means the version running has failed to prove itself too often.
+	Started() bool
+	// Confirm is called after a successful check-in.
+	Confirm()
+	// Overdue reports whether an unconfirmed update has run out of time.
+	Overdue(now time.Time) bool
+	// Rollback puts the previous build back.
+	Rollback() error
+}
+
 // Loop is one agent's heartbeat.
 type Loop struct {
 	State    *state.State
@@ -43,6 +55,10 @@ type Loop struct {
 	Log      func(format string, args ...any)
 	// Sleep waits for d or until ctx ends. Injectable so tests do not wait.
 	Sleep func(ctx context.Context, d time.Duration)
+	// Guard, if set, confirms or rolls back a freshly installed version.
+	Guard Guard
+	// Restart stops the loop so the service manager can start the agent again (after an update or a rollback).
+	Restart func()
 
 	mu      sync.Mutex
 	running bool
@@ -72,6 +88,9 @@ func (l *Loop) Once(ctx context.Context) (time.Duration, error) {
 	resp, err := l.Platform.CheckIn(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if l.Guard != nil {
+		l.Guard.Confirm() // a successful check-in is what a new version has to prove
 	}
 	interval := time.Duration(resp.PollIntervalSeconds) * time.Second
 	if interval <= 0 {
@@ -138,6 +157,11 @@ func (l *Loop) start(ctx context.Context, task *taskverify.Task) bool {
 		final := l.Runner.Run(ctx, task)
 		l.report(ctx, task.ID, final)
 		l.logf("finished %s (%s): %s", task.Name, task.ID, final.Status)
+		// A task that changed the agent itself (an update) is reported first, then the agent restarts to become the new one.
+		if rr, ok := l.Runner.(interface{ RestartRequested() bool }); ok && rr.RestartRequested() && l.Restart != nil {
+			l.logf("restarting to finish %s", task.Name)
+			l.Restart()
+		}
 	}()
 	return true
 }
@@ -182,8 +206,15 @@ func (l *Loop) sleep(ctx context.Context, d time.Duration) {
 // Run calls the platform until ctx ends. A failed call is retried with a growing wait (and some jitter, so a fleet that lost
 // the platform does not return in step); a 401 means the agent is not, or no longer, accepted, so it waits long between tries.
 func (l *Loop) Run(ctx context.Context) {
+	if l.Guard != nil && l.Guard.Started() {
+		l.rollback("it has restarted too many times without proving itself")
+	}
 	failures := 0
 	for ctx.Err() == nil {
+		if l.Guard != nil && l.Guard.Overdue(l.now()) {
+			l.rollback("it could not check in with the platform in time")
+			break
+		}
 		next, err := l.Once(ctx)
 		if err != nil {
 			failures++
@@ -216,4 +247,15 @@ func backoff(failures int) time.Duration {
 
 func jitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int63n(int64(d)/10+1))
+}
+
+// rollback puts the previous build back and asks to be restarted into it.
+func (l *Loop) rollback(why string) {
+	l.logf("rolling back the update: %s", why)
+	if err := l.Guard.Rollback(); err != nil {
+		l.logf("the rollback could not be completed: %v", err)
+	}
+	if l.Restart != nil {
+		l.Restart()
+	}
 }

@@ -3,12 +3,15 @@ package runner
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
 )
 
 func newRunner() Runner {
@@ -149,5 +152,82 @@ func TestTheTimeoutReachesTheTask(t *testing.T) {
 	rn.Run(context.Background(), &taskverify.Task{Name: "survey", TimeoutSeconds: 120})
 	if d := deadline.Sub(start); d < 119*time.Second || d > 121*time.Second {
 		t.Errorf("deadline in %v, want ~120s", d)
+	}
+}
+
+type fakeUpdater struct {
+	out    update.Outcome
+	err    error
+	called []update.Params
+}
+
+func (f *fakeUpdater) Apply(_ context.Context, p update.Params) (update.Outcome, error) {
+	f.called = append(f.called, p)
+	return f.out, f.err
+}
+
+func updateTask(params map[string]any) *taskverify.Task {
+	return &taskverify.Task{Name: "update-agent", TimeoutSeconds: 300, Params: params}
+}
+
+var goodUpdate = map[string]any{"version": "0.3.0", "sha256": map[string]any{"amd64": strings.Repeat("a", 64), "arm64": strings.Repeat("b", 64)}}
+
+func TestUpdateAgentInstallsTheBuildAndAsksToRestartAfterReporting(t *testing.T) {
+	f := &fakeUpdater{out: update.Outcome{From: "0.2.0", To: "0.3.0", Changed: true}}
+	r := newRunner()
+	r.Updater, r.Restart = f, &atomic.Bool{}
+	report := r.Run(context.Background(), updateTask(goodUpdate))
+	if report.Status != "done" || *report.ExitCode != 0 || report.Output != "updated from 0.2.0 to 0.3.0; restarting to start the new version" {
+		t.Errorf("%+v", report)
+	}
+	if !r.RestartRequested() {
+		t.Error("a replaced binary must ask to be restarted")
+	}
+	if len(f.called) != 1 || f.called[0].Version != "0.3.0" || f.called[0].SHA256["amd64"] == "" {
+		t.Errorf("the signed parameters must reach the updater: %+v", f.called)
+	}
+}
+
+func TestUpdateAgentToTheVersionAlreadyRunningIsDoneWithoutRestarting(t *testing.T) {
+	r := newRunner()
+	r.Updater, r.Restart = &fakeUpdater{out: update.Outcome{From: "0.3.0", To: "0.3.0"}}, &atomic.Bool{}
+	report := r.Run(context.Background(), updateTask(goodUpdate))
+	if report.Status != "done" || report.Output != "already at 0.3.0" || r.RestartRequested() {
+		t.Errorf("%+v restart=%v", report, r.RestartRequested())
+	}
+}
+
+func TestUpdateAgentFailsWithTheReasonAndNeverRestarts(t *testing.T) {
+	for name, tc := range map[string]struct {
+		updater *fakeUpdater
+		params  map[string]any
+		want    string
+	}{
+		"the updater refuses": {&fakeUpdater{err: errors.New("the download does not match the checksum the platform signed")}, goodUpdate, "does not match"},
+		"bad parameters":      {&fakeUpdater{}, map[string]any{"version": "latest"}, "no usable version"},
+	} {
+		r := newRunner()
+		r.Updater, r.Restart = tc.updater, &atomic.Bool{}
+		report := r.Run(context.Background(), updateTask(tc.params))
+		if report.Status != "failed" || !strings.Contains(report.Output, tc.want) || r.RestartRequested() {
+			t.Errorf("%s: %+v", name, report)
+		}
+		if name == "bad parameters" && len(tc.updater.called) != 0 {
+			t.Error("nothing may be tried with parameters that do not validate")
+		}
+	}
+	r := newRunner() // built without an updater
+	if report := r.Run(context.Background(), updateTask(goodUpdate)); report.Status != "failed" {
+		t.Errorf("%+v", report)
+	}
+}
+
+func TestTheCatalogIncludesUpdateAgent(t *testing.T) {
+	found := false
+	for _, n := range newRunner().Names() {
+		found = found || n == "update-agent"
+	}
+	if !found {
+		t.Error("the agent must carry update-agent in its catalog")
 	}
 }

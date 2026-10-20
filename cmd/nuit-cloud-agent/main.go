@@ -12,7 +12,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
 )
 
 // version is set at build time: -ldflags "-X main.version=1.2.3".
@@ -47,6 +51,8 @@ func main() {
 		err = surveyCmd()
 	case "profile-check":
 		err = profileCheck(args)
+	case "selftest":
+		err = selftest(args)
 	case "version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -74,6 +80,8 @@ func usage() {
         Read this machine and print what the platform would be told. Changes nothing.
   profile-check <profile>
         Compare this machine with a profile and print the result as JSON. Changes nothing.
+  selftest [--state-dir dir] [--insecure-http]
+        Load this machine's identity and make one real check-in, then print ok. Used before an update replaces the agent.
   version
 `)
 }
@@ -149,6 +157,18 @@ func run(args []string) error {
 	}
 	c.Credential = st.Credential
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Updating itself: the running binary, and a guard that confirms a freshly installed version or puts the old one back.
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	restart := &atomic.Bool{}
 	l := &loop.Loop{
 		State:    st,
 		Platform: c,
@@ -156,11 +176,13 @@ func run(args []string) error {
 			Version:  version,
 			Survey:   func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
 			Profiles: profiles.Runner{},
+			Updater:  update.Updater{BaseURL: c.BaseURL, HTTP: c.HTTP, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
+			Restart:  restart,
 		},
-		Log: logger.Printf,
+		Guard:   update.Guard{ExePath: exe, Version: version, State: st},
+		Restart: stop, // the service manager starts the agent again; the new binary is what runs
+		Log:     logger.Printf,
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	logger.Printf("nuit-cloud-agent %s: %s (%s) calling %s", version, st.Name, st.MachineID, st.PlatformURL)
 	l.Run(ctx)
 	logger.Printf("stopping")
@@ -205,5 +227,31 @@ func profileCheck(args []string) error {
 		return err
 	}
 	fmt.Println(string(out))
+	return nil
+}
+
+// selftest proves this build can start on this machine: it loads the identity, reaches the platform and is accepted. An update
+// runs it on the new build before replacing the running one. The check-in it makes is a normal one (tasks it is handed are
+// not run or reported, so the platform offers them again).
+func selftest(args []string) error {
+	fs := flag.NewFlagSet("selftest", flag.ExitOnError)
+	insecure := insecureFlag(fs)
+	dir := stateDirFlag(fs)
+	_ = fs.Parse(args)
+	st, err := state.Load(*dir)
+	if err != nil {
+		return err
+	}
+	c, err := client.New(st.PlatformURL, version, *insecure)
+	if err != nil {
+		return err
+	}
+	c.Credential = st.Credential
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := c.CheckIn(ctx); err != nil {
+		return err
+	}
+	fmt.Println("ok")
 	return nil
 }
