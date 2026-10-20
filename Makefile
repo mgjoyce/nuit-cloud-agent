@@ -27,4 +27,4 @@ sync-bootstrap:
 	rm -rf internal/profiles/bootstrap
 	mkdir -p internal/profiles/bootstrap/profiles
 	cp $(BOOTSTRAP_SRC)/bootstrap.sh $(BOOTSTRAP_SRC)/features.sh internal/profiles/bootstrap/
-	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh internal/profiles/bootstrap/profiles/
+	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-address.sh internal/profiles/bootstrap/profiles/

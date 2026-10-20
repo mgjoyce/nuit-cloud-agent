@@ -461,7 +461,13 @@ STATIC
   ip -4 -o addr show dev "$A_IF" 2>/dev/null | awk '{print $4}' | grep -qx "$target/$A_PREFIX" || ip addr add "$target/$A_PREFIX" dev "$A_IF" 2>/dev/null || true
   ip route replace default via "$A_GW" dev "$A_IF" 2>/dev/null || true
   # 4. the old address goes, only now
-  if [ "$added" = 1 ]; then ip addr del "$A_CUR/$A_PREFIX" dev "$A_IF" 2>/dev/null || true; fi
+  if [ "$added" = 1 ]; then
+    ip addr del "$A_CUR/$A_PREFIX" dev "$A_IF" 2>/dev/null || true
+    # removing the primary address takes its secondaries with it unless the kernel promotes them (the sysctl above, which a
+    # restricted system may refuse): so the new address and the route are asserted again, which is harmless when they survived
+    ip -4 -o addr show dev "$A_IF" 2>/dev/null | awk '{print $4}' | grep -qx "$target/$A_PREFIX" || ip addr add "$target/$A_PREFIX" dev "$A_IF" 2>/dev/null || true
+    ip route replace default via "$A_GW" dev "$A_IF" 2>/dev/null || true
+  fi
 
   # 5. proof: the platform must be reachable from the new address
   proved=0
