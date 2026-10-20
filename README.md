@@ -63,3 +63,19 @@ Version 0.2.x. Built: enrolment, check-in, signed-task verification, `ping`, `su
 ## License
 
 MIT. See LICENSE.
+
+## Releases and how to verify one
+
+A release (a `v*` tag) is built by `.github/workflows/release.yml` on GitHub's runners and carries both Linux binaries,
+`SHA256SUMS`, and `SHA256SUMS.sigstore.json`: a keyless [cosign](https://github.com/sigstore/cosign) signature over the
+checksums. There is no long-lived key to lose: the signing identity is the workflow itself, recorded in a certificate and in
+the public Rekor log. To check a download:
+
+```sh
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/mgjoyce/nuit-cloud-agent/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+The platform's `deploy/fetch-agent-release.sh` does exactly this before it will serve a build.
