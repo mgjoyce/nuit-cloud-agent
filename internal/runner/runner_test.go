@@ -79,20 +79,33 @@ func TestACheckThatFindsDriftIsDoneBecauseTheDriftIsTheAnswer(t *testing.T) {
 	}
 }
 
-func TestAnApplyIsDoneOnlyWhenEveryFeatureIsSatisfied(t *testing.T) {
+func TestAnApplyIsFailedOnlyWhenAFeatureFailedNotWhenAPersonIsNeeded(t *testing.T) {
 	good := &fakeProfiles{exit: 0, res: profiles.Result{Features: []profiles.Feature{{Name: "user", Status: "ok"}, {Name: "journal", Status: "applied"}}}}
 	r := withProfiles(good).Run(context.Background(), profileTask("profile-apply"))
 	if r.Status != "done" || *r.ExitCode != 0 || good.calls[0] != "apply nuit-cloud-server" {
 		t.Errorf("%+v %v", r, good.calls)
 	}
 
+	// something is left for a person: the task did its job, so it is done, and says what is left
 	needsPerson := &fakeProfiles{exit: 1, res: profiles.Result{RebootNeeded: true, Features: []profiles.Feature{{Name: "kvm", Status: "manual"}, {Name: "journal", Status: "applied"}}}}
 	r = withProfiles(needsPerson).Run(context.Background(), profileTask("profile-apply"))
-	if r.Status != "failed" || *r.ExitCode != 1 || r.Output != "apply nuit-cloud-server: 1 of 2 features satisfied; still to do: kvm (manual); a reboot is needed" {
+	if r.Status != "done" || *r.ExitCode != 1 || r.Output != "apply nuit-cloud-server: 1 of 2 features satisfied; still to do: kvm (manual); a reboot is needed" {
 		t.Errorf("%+v", r)
 	}
 	if r.Result == nil {
-		t.Error("the findings must still be sent when an apply is not finished")
+		t.Error("the findings must still be sent")
+	}
+
+	// a feature that really failed is a failed apply
+	broken := &fakeProfiles{exit: 1, res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_packages", Status: "failed"}, {Name: "journal", Status: "applied"}}}}
+	if r := withProfiles(broken).Run(context.Background(), profileTask("profile-apply")); r.Status != "failed" || r.Result == nil {
+		t.Errorf("%+v", r)
+	}
+
+	// the scripts produced nothing at all and exited non-zero: failed
+	empty := &fakeProfiles{exit: 2, res: profiles.Result{Features: []profiles.Feature{}}}
+	if r := withProfiles(empty).Run(context.Background(), profileTask("profile-apply")); r.Status != "failed" {
+		t.Errorf("%+v", r)
 	}
 }
 

@@ -69,8 +69,8 @@ func (r Runner) now() time.Time {
 }
 
 // profile checks or applies a profile. A check that finds drift has still done its job (the drift is the answer), so it is
-// `done`; an apply is `done` only when every feature ends up satisfied, otherwise `failed` with what is left, because a
-// machine that still needs a person is not finished.
+// `done`. An apply is `failed` only if a feature actually failed; a feature that needs a person (a cable, SSH settings, the
+// BIOS) is not a failure of the task, so the apply is `done` and the summary and the per-feature results say what is left.
 func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Report {
 	one := 1
 	name, _ := task.Params["profile"].(string)
@@ -83,8 +83,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
 	summary := summarise(res)
-	if apply && exit != 0 {
-		return client.Report{Status: "failed", ExitCode: &exit, Output: summary, Result: res}
+	for _, f := range res.Features {
+		if apply && f.Status == "failed" {
+			return client.Report{Status: "failed", ExitCode: &exit, Output: summary, Result: res}
+		}
+	}
+	if apply && exit != 0 && len(res.Features) == 0 {
+		return client.Report{Status: "failed", ExitCode: &exit, Output: summary + " (it produced no result)", Result: res}
 	}
 	return client.Report{Status: "done", ExitCode: &exit, Output: summary, Result: res}
 }
