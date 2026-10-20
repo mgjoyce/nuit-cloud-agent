@@ -92,8 +92,8 @@ func (r Runner) Names() []string {
 var ErrNeedsRoot = errors.New("applying a profile needs root, and the agent is not running as root")
 
 // Run checks (change nothing) or applies a profile. The exit status of the scripts is returned with the result: 0 means every
-// feature is satisfied.
-func (r Runner) Run(ctx context.Context, profile string, apply bool) (Result, int, error) {
+// feature is satisfied. env is added to the scripts' environment (the runtime's staged files, when the task carries them).
+func (r Runner) Run(ctx context.Context, profile string, apply bool, env ...string) (Result, int, error) {
 	known := false
 	for _, n := range r.Names() {
 		known = known || n == profile
@@ -132,6 +132,9 @@ func (r Runner) Run(ctx context.Context, profile string, apply bool) (Result, in
 		command = exec.CommandContext
 	}
 	cmd := command(ctx, "sh", args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	out, runErr := cmd.CombinedOutput()
 	exit := 0
 	if runErr != nil {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
@@ -45,9 +46,11 @@ type fakeProfiles struct {
 	exit  int
 	err   error
 	calls []string
+	env   []string
 }
 
-func (f *fakeProfiles) Run(_ context.Context, profile string, apply bool) (profiles.Result, int, error) {
+func (f *fakeProfiles) Run(_ context.Context, profile string, apply bool, env ...string) (profiles.Result, int, error) {
+	f.env = env
 	mode := "check"
 	if apply {
 		mode = "apply"
@@ -229,5 +232,68 @@ func TestTheCatalogIncludesUpdateAgent(t *testing.T) {
 	}
 	if !found {
 		t.Error("the agent must carry update-agent in its catalog")
+	}
+}
+
+type fakeStager struct {
+	err     error
+	staged  int
+	cleaned int
+}
+
+func (f *fakeStager) Stage(_ context.Context, _ runtimeinstall.Params) ([]string, func(), error) {
+	f.staged++
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return []string{"NCS_RUNTIME_BUNDLE=/stage/bundle"}, func() { f.cleaned++ }, nil
+}
+
+func runtimeTask(name string) *taskverify.Task {
+	hex := func(c string) string { return strings.Repeat(c, 64) }
+	return &taskverify.Task{Name: name, TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-container-service", "runtime": map[string]any{
+		"bundleVersion": "v4", "bundleSha256": hex("a"), "containerdVersion": "2.2.10", "containerdSha256": hex("b"), "rootFingerprint": hex("c"),
+	}}}
+}
+
+func TestAProfileApplyThatCarriesTheRuntimeStagesItAndHandsItToTheScripts(t *testing.T) {
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "oci_saas_runtime", Status: "applied"}}}}
+	st := &fakeStager{}
+	r := withProfiles(f)
+	r.Runtime = st
+	rep := r.Run(context.Background(), runtimeTask("profile-apply"))
+	if rep.Status != "done" || st.staged != 1 || st.cleaned != 1 || len(f.env) != 1 || f.env[0] != "NCS_RUNTIME_BUNDLE=/stage/bundle" {
+		t.Errorf("%+v staged=%d cleaned=%d env=%v", rep, st.staged, st.cleaned, f.env)
+	}
+}
+
+func TestAFailedStageStopsTheApplyBeforeAnythingRuns(t *testing.T) {
+	f := &fakeProfiles{}
+	r := withProfiles(f)
+	r.Runtime = &fakeStager{err: errors.New("does not match the checksum")}
+	rep := r.Run(context.Background(), runtimeTask("profile-apply"))
+	if rep.Status != "failed" || len(f.calls) != 0 || !strings.Contains(rep.Output, "does not match") {
+		t.Errorf("%+v calls=%v", rep, f.calls)
+	}
+}
+
+func TestACheckNeedsNoDownloadButKnowsWhichBundleIsPinned(t *testing.T) {
+	f := &fakeProfiles{}
+	st := &fakeStager{}
+	r := withProfiles(f)
+	r.Runtime = st
+	r.Run(context.Background(), runtimeTask("profile-check"))
+	if st.staged != 0 || len(f.env) != 1 || f.env[0] != "NCS_RUNTIME_BUNDLE_SHA256="+strings.Repeat("a", 64) {
+		t.Errorf("staged=%d env=%v", st.staged, f.env)
+	}
+}
+
+func TestBadRuntimeParametersAreRefused(t *testing.T) {
+	r := withProfiles(&fakeProfiles{})
+	r.Runtime = &fakeStager{}
+	task := runtimeTask("profile-apply")
+	task.Params["runtime"].(map[string]any)["bundleSha256"] = "../../etc/passwd"
+	if rep := r.Run(context.Background(), task); rep.Status != "failed" {
+		t.Errorf("%+v", rep)
 	}
 }

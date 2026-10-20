@@ -195,10 +195,73 @@ f_kvm_do() {
 f_cgroup2_ok() { [ -e "$(p /sys/fs/cgroup/cgroup.controllers)" ]; }
 f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified_cgroup_hierarchy=1 on the kernel command line), then reboot" >&2; return 3; }
 
-# The runtime itself (a dedicated containerd, the shim, the CNI bridge) comes from the signed bundle of the oci-saas work; the
-# installer for it is not built yet (ticket #39), so until it is this says what is missing.
-f_oci_saas_runtime_ok() { [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas; }
-f_oci_saas_runtime_do() { echo "  install the Nuit Container Service runtime from the signed bundle (INSTALL.txt inside it); automating that is ticket #39" >&2; return 3; }
+# The Nuit Container Service runtime (a dedicated containerd service beside any Docker, the shim, the CNI bridge, the signed
+# guest artifacts), installed from the oci-saas bundle. The agent hands this feature what it needs when the platform asks for a
+# profile-apply, already downloaded and checked against the SHA-256 in the signed task:
+#   NCS_RUNTIME_BUNDLE            the bundle tarball (oci-saas-bundle.tar.gz)
+#   NCS_RUNTIME_BUNDLE_SHA256     its SHA-256 (recorded on the machine, so a different pinned bundle shows as drift)
+#   NCS_RUNTIME_ROOT_FINGERPRINT  the fingerprint of the root key the bundle's keys must chain to. artifacts.pub comes from the
+#                                 bundle, so checking the guest artifacts against it alone would be circular: this pins the anchor
+#   NCS_CONTAINERD_TARBALL        the pinned official containerd 2.x release (Debian's own package is 1.7)
+# Run by hand without them, the feature says what is missing. The first install gives the node the bundle's initial policy, which
+# admits namespace nuit-cloud-platform only; the platform's hourly policy-sync replaces it once the node is a registered pool host.
+OCISAAS_ETC="${OCISAAS_ETC:-/etc/oci-saas}"
+f_oci_saas_runtime_ok() {
+  [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas \
+    && [ -e "$(p /run/oci-saas/containerd.sock)" ] \
+    && [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ] || return 1
+  # when the platform names a bundle, the one installed must be it (an upgrade then shows as drift)
+  [ -z "${NCS_RUNTIME_BUNDLE_SHA256:-}" ] || [ "$(cat "$(p "$OCISAAS_ETC/installed-bundle")" 2>/dev/null)" = "$NCS_RUNTIME_BUNDLE_SHA256" ]
+}
+
+# The fingerprint of the root key in a keys file (`root <hex>`): the SHA-256 of the key's bytes.
+root_fingerprint_of() { # root_fingerprint_of <artifacts.pub>
+  awk '$1=="root" {print $2; exit}' "$1" | xxd -r -p | sha256sum | awk '{print $1}'
+}
+
+f_oci_saas_runtime_do() {
+  if [ -z "${NCS_RUNTIME_BUNDLE:-}" ] || [ -z "${NCS_CONTAINERD_TARBALL:-}" ] || [ -z "${NCS_RUNTIME_ROOT_FINGERPRINT:-}" ]; then
+    echo "  the runtime comes from the oci-saas bundle: ask for this profile from the platform, which gives the agent the bundle, containerd and the root fingerprint to check it against" >&2; return 3
+  fi
+  [ -f "$NCS_RUNTIME_BUNDLE" ] && [ -f "$NCS_CONTAINERD_TARBALL" ] || { echo "  the bundle or the containerd tarball is not where the agent said it put it" >&2; return 1; }
+  [ -e "$(p /dev/kvm)" ] || { echo "  /dev/kvm is missing: the kvm feature comes first" >&2; return 3; }
+  sv="$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')"
+  [ "${sv:-0}" -ge 254 ] 2>/dev/null || { echo "  the runtime needs systemd 254 or newer (this is ${sv:-unknown})" >&2; return 3; }
+
+  # A containerd already at /usr/bin that is not 2.x belongs to something else (Docker's package); it is not replaced.
+  have="$("$(p /usr/bin/containerd)" --version 2>/dev/null || true)"
+  if [ -n "$have" ] && ! printf '%s' "$have" | grep -qE ' v?2\.'; then
+    echo "  /usr/bin/containerd is $have; the runtime needs 2.x and will not replace another service's containerd: a person decides" >&2; return 3
+  fi
+
+  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins cri-tools xxd || return 1
+
+  work="$(mktemp -d)"
+  tar -xzf "$NCS_RUNTIME_BUNDLE" -C "$work" || { rm -rf "$work"; echo "  the bundle is not a readable tarball" >&2; return 1; }
+  dir="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -1)"
+  [ -n "$dir" ] && [ -x "$dir/packaging/dedicated/install.sh" ] && [ -f "$dir/artifacts.pub" ] && [ -f "$dir/policy.pub" ] \
+    || { rm -rf "$work"; echo "  the bundle does not have the layout of an oci-saas bundle" >&2; return 1; }
+  got="$(root_fingerprint_of "$dir/artifacts.pub")"
+  if [ "$got" != "$NCS_RUNTIME_ROOT_FINGERPRINT" ]; then
+    rm -rf "$work"; echo "  the bundle's keys chain to root $got, not the root the platform pinned: nothing was installed" >&2; return 1
+  fi
+
+  if [ -z "$have" ]; then
+    tar -xzf "$NCS_CONTAINERD_TARBALL" -C "$work" bin/containerd || { rm -rf "$work"; echo "  could not unpack containerd" >&2; return 1; }
+    install -m 0755 "$work/bin/containerd" "$(p /usr/bin/containerd)"
+  fi
+
+  # first install: the bundle's own policy; every later run keeps the policy the platform has published and restarts
+  mode="--policy-dir $dir/policy"
+  [ -e "$(p "$OCISAAS_ETC/installed-bundle")" ] && mode="--keep-policy --restart"
+  # shellcheck disable=SC2086
+  "$dir/packaging/dedicated/install.sh" --bin "$dir/bin" --guest "$dir/guest" --artifacts-pub "$dir/artifacts.pub" \
+    --policy-pub "$dir/policy.pub" $mode --cni-bin /usr/lib/cni --add-user "$NC_USER" \
+    || { rm -rf "$work"; echo "  the bundle's install.sh failed (its output is above)" >&2; return 1; }
+  mkdir -p "$(p "$OCISAAS_ETC")"
+  printf '%s\n' "${NCS_RUNTIME_BUNDLE_SHA256:-unknown}" >"$(p "$OCISAAS_ETC/installed-bundle")"
+  rm -rf "$work"
+}
 
 # Tenants' volumes are disk images under the runtime's directory (default /var/lib/oci-saas) and need room to grow. If the
 # filesystem that directory would be on has less than MIN_VOLUMES_GIB free and another real filesystem has far more, the

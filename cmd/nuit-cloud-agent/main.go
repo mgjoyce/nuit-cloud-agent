@@ -23,6 +23,7 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
@@ -176,6 +177,7 @@ func run(args []string) error {
 			Version:  version,
 			Survey:   func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
 			Profiles: profiles.Runner{},
+			Runtime:  runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c.HTTP, Dir: filepath.Join(*dir, "stage")},
 			Updater:  update.Updater{BaseURL: c.BaseURL, HTTP: c.HTTP, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
 			Restart:  restart,
 		},

@@ -10,6 +10,7 @@ import (
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/update"
@@ -17,7 +18,7 @@ import (
 
 // ProfileRunner checks or applies a profile (profiles.Runner; injectable so tests touch no real system).
 type ProfileRunner interface {
-	Run(ctx context.Context, profile string, apply bool) (profiles.Result, int, error)
+	Run(ctx context.Context, profile string, apply bool, env ...string) (profiles.Result, int, error)
 }
 
 // SelfUpdater replaces the running agent with a newer build (update.Updater; injectable so tests touch no real binary).
@@ -32,7 +33,9 @@ type Runner struct {
 	// Survey reads the machine; injectable so tests need no real machine.
 	Survey   func(ctx context.Context) survey.Report
 	Profiles ProfileRunner
-	Updater  SelfUpdater
+	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
+	Runtime RuntimeStager
+	Updater SelfUpdater
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -93,7 +96,26 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		return client.Report{Status: "failed", ExitCode: &one, Output: "this agent was built without profiles"}
 	}
 	apply := task.Name == "profile-apply"
-	res, exit, err := r.Profiles.Run(ctx, name, apply)
+	var env []string
+	if raw, ok := task.Params["runtime"].(map[string]any); ok && apply {
+		if r.Runtime == nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot install the runtime"}
+		}
+		params, err := runtimeinstall.ParseParams(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		staged, cleanup, err := r.Runtime.Stage(ctx, params)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "could not stage the runtime: " + err.Error()}
+		}
+		defer cleanup()
+		env = staged
+	} else if ok {
+		// a check needs no files: it only asks whether what is installed is healthy
+		env = []string{"NCS_RUNTIME_BUNDLE_SHA256=" + stringParam(raw, "bundleSha256")}
+	}
+	res, exit, err := r.Profiles.Run(ctx, name, apply, env...)
 	if err != nil {
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
@@ -107,6 +129,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		return client.Report{Status: "failed", ExitCode: &exit, Output: summary + " (it produced no result)", Result: res}
 	}
 	return client.Report{Status: "done", ExitCode: &exit, Output: summary, Result: res}
+}
+
+func stringParam(m map[string]any, k string) string { s, _ := m[k].(string); return s }
+
+// RuntimeStager downloads and checks the runtime's files (runtimeinstall.Stager).
+type RuntimeStager interface {
+	Stage(ctx context.Context, p runtimeinstall.Params) (env []string, cleanup func(), err error)
 }
 
 // summarise says in a line or two how a profile run went.
