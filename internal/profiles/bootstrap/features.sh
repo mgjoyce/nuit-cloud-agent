@@ -261,12 +261,22 @@ f_oci_saas_runtime_do() {
   fi
 
   # first install: the bundle's own policy; every later run keeps the policy the platform has published and restarts
-  mode="--policy-dir $dir/policy"
-  [ -e "$(p "$OCISAAS_ETC/installed-bundle")" ] && mode="--keep-policy --restart"
+  mode="--policy-dir $dir/policy"; restart_after=
+  if [ -e "$(p "$OCISAAS_ETC/installed-bundle")" ]; then
+    if grep -q -- '--keep-policy' "$dir/packaging/dedicated/install.sh"; then
+      mode="--keep-policy --restart"
+    else
+      # an older bundle's install.sh has no --keep-policy: hand it a copy of the policy files the node has now
+      mkdir -p "$work/keep-policy" && cp "$(p /var/lib/oci-saas/policy)"/policy.json* "$work/keep-policy/" \
+        || { rm -rf "$work"; echo "  could not read the installed policy to keep it; nothing was changed" >&2; return 1; }
+      mode="--policy-dir $work/keep-policy"; restart_after=1
+    fi
+  fi
   # shellcheck disable=SC2086
   "$dir/packaging/dedicated/install.sh" --bin "$dir/bin" --guest "$dir/guest" --artifacts-pub "$dir/artifacts.pub" \
     --policy-pub "$dir/policy.pub" $mode --cni-bin /usr/lib/cni --add-user "$NC_USER" \
     || { rm -rf "$work"; echo "  the bundle's install.sh failed (its output is above)" >&2; return 1; }
+  [ -z "$restart_after" ] || systemctl restart containerd-ocisaas   # running pods keep running
   mkdir -p "$(p "$OCISAAS_ETC")" "$(dirname "$(p "$OCISAAS_SMOKE")")"
   install -m 0755 "$dir/packaging/dedicated/smoke.sh" "$(p "$OCISAAS_SMOKE")"
   printf '%s\n' "${NCS_RUNTIME_BUNDLE_SHA256:-unknown}" >"$(p "$OCISAAS_ETC/installed-bundle")"
