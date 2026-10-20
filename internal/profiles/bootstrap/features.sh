@@ -539,3 +539,158 @@ STATIC
   rm -f "$d/armed"
   echo "  $A_IF now uses $target/$A_PREFIX as a static address (was $A_CUR; the old configuration is in $ADDR_DIR/backup)"
 }
+
+# ─── The tenant VLAN slice (ticket #67; ports deploy/server-vlan5.sh) ───────────────────────────────────────────────────────
+# Adds a VLAN sub-interface on the machine's default-route interface carrying the slice the platform allocated: the node's own
+# address and the tenant block as secondary addresses, plus the rules that send replies for connections that arrived on the VLAN
+# back out by the VLAN gateway (without them a reply from a tenant address leaves by the wrong interface and the router drops it).
+# The agent passes NCS_VLAN_ID, NCS_VLAN_ADDRESS, NCS_VLAN_PREFIX, NCS_VLAN_GATEWAY and NCS_VLAN_TENANT_ADDRESSES.
+# The VLAN is assumed to be carried to the port already, so a gateway that does not answer is a note, not a failure. What can hurt
+# is the change taking the machine's own connectivity with it, so as for the management address: a timer that undoes it is armed
+# first; nothing existing is touched (a new interface only); a snapshot proves no address or route was lost; and the platform must
+# still be reachable afterwards, or everything is undone.
+VLAN_TABLE="${VLAN_TABLE:-105}"
+VLAN_MARK="${VLAN_MARK:-0x5}"
+
+vlan_file() { printf '/etc/network/interfaces.d/nuit-cloud-vlan%s' "$NCS_VLAN_ID"; }
+
+vlan_render() { # vlan_render <interface>  -> the stanza on stdout
+  _if="$1"; _vif="$_if.$NCS_VLAN_ID"
+  cat <<EOF
+# Managed by the nuit-cloud agent (ncs_vlan): the tenant VLAN slice the platform allocated for this machine.
+auto ${_vif}
+iface ${_vif} inet static
+    address ${NCS_VLAN_ADDRESS}/${NCS_VLAN_PREFIX}
+    pre-up modprobe 8021q 2>/dev/null || true
+    pre-up ip link show ${_vif} >/dev/null 2>&1 || ip link add link ${_if} name ${_vif} type vlan id ${NCS_VLAN_ID}
+EOF
+  for a in $NCS_VLAN_TENANT_ADDRESSES; do
+    echo "    post-up ip addr add ${a}/${NCS_VLAN_PREFIX} dev ${_vif} 2>/dev/null || true"
+  done
+  cat <<EOF
+    post-up sysctl -qw net.ipv4.conf.${_if}/${NCS_VLAN_ID}.rp_filter=2
+    post-up iptables -t mangle -C PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK} 2>/dev/null || iptables -t mangle -A PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK}
+    post-up iptables -t mangle -C PREROUTING ! -i ${_vif} -m connmark --mark ${VLAN_MARK} -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING ! -i ${_vif} -m connmark --mark ${VLAN_MARK} -j CONNMARK --restore-mark
+    post-up ip route replace default via ${NCS_VLAN_GATEWAY} dev ${_vif} table ${VLAN_TABLE}
+    post-up ip rule show | grep -q "fwmark ${VLAN_MARK} lookup ${VLAN_TABLE}" || ip rule add fwmark ${VLAN_MARK} lookup ${VLAN_TABLE} priority 1050
+    pre-down ip rule del fwmark ${VLAN_MARK} lookup ${VLAN_TABLE} 2>/dev/null || true
+    pre-down iptables -t mangle -D PREROUTING ! -i ${_vif} -m connmark --mark ${VLAN_MARK} -j CONNMARK --restore-mark 2>/dev/null || true
+    pre-down iptables -t mangle -D PREROUTING -i ${_vif} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${VLAN_MARK} 2>/dev/null || true
+    pre-down ip route flush table ${VLAN_TABLE} 2>/dev/null || true
+    post-down ip link del ${_vif} 2>/dev/null || true
+EOF
+}
+
+vlan_inputs_ok() {
+  printf '%s' "${NCS_VLAN_ID:-}" | grep -Eq '^[0-9]{1,4}$' || return 1
+  printf '%s' "${NCS_VLAN_PREFIX:-}" | grep -Eq '^[0-9]{1,2}$' || return 1
+  addr_is_ipv4 "${NCS_VLAN_ADDRESS:-}" && addr_is_ipv4 "${NCS_VLAN_GATEWAY:-}" || return 1
+  [ -n "${NCS_VLAN_TENANT_ADDRESSES:-}" ] || return 1
+  for a in $NCS_VLAN_TENANT_ADDRESSES; do addr_is_ipv4 "$a" || return 1; done
+  return 0
+}
+
+f_ncs_vlan_ok() {
+  vlan_inputs_ok && addr_discover || return 1
+  _file="$(p "$(vlan_file)")"
+  _vif="$A_IF.$NCS_VLAN_ID"
+  # exactly what this feature writes, or an equivalent configuration made by hand (deploy/server-vlan5.sh): the same sub-interface with
+  # the same address and tenant block named in it. A working VLAN made by hand is adopted as it is, never rewritten.
+  if ! vlan_render "$A_IF" | cmp -s - "$_file" 2>/dev/null; then
+    grep -Eq "^[[:space:]]*iface[[:space:]]+$_vif[[:space:]]+inet[[:space:]]+static" "$_file" 2>/dev/null || return 1
+    grep -Eq "^[[:space:]]*address[[:space:]]+$NCS_VLAN_ADDRESS/$NCS_VLAN_PREFIX" "$_file" || return 1
+    # the tenant block must be exactly the same set, not a part of it
+    _in_file="$(grep -o 'ip addr add [0-9.]*' "$_file" | awk '{print $4}' | sort | tr '\n' ' ')"
+    _wanted="$(printf '%s\n' $NCS_VLAN_TENANT_ADDRESSES | sort | tr '\n' ' ')"
+    [ "$_in_file" = "$_wanted" ] || return 1
+  fi
+  _have="$(ip -4 -o addr show dev "$_vif" 2>/dev/null | awk '{print $4}')"
+  for a in "$NCS_VLAN_ADDRESS" $NCS_VLAN_TENANT_ADDRESSES; do printf '%s\n' "$_have" | grep -qx "$a/$NCS_VLAN_PREFIX" || return 1; done
+  return 0
+}
+
+f_ncs_vlan_do() {
+  vlan_inputs_ok || { echo "  the VLAN slice was not given, or is not valid: allocate one in the portal, then apply this profile from there" >&2; return 3; }
+  command -v ifup >/dev/null 2>&1 && [ -f "$(p /etc/network/interfaces)" ] || { echo "  this machine does not use ifupdown: set the VLAN up by hand (deploy/server-vlan5.sh)" >&2; return 3; }
+  for m in NetworkManager systemd-networkd; do
+    ! systemctl is-active --quiet "$m" 2>/dev/null || { echo "  $m manages the network here; this feature only handles ifupdown" >&2; return 3; }
+  done
+  command -v systemd-run >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 || { echo "  systemd-run (the safety timer) and iptables (reply routing) are needed" >&2; return 3; }
+  addr_discover && [ -n "$A_GW" ] || { echo "  could not find the default route and its interface" >&2; return 3; }
+  printf '%s\n' "$A_IF" | grep -Eq '^[a-zA-Z0-9_-]{1,10}$' || { echo "  the interface name $A_IF cannot carry a VLAN sub-interface here" >&2; return 3; }
+  vif="$A_IF.$NCS_VLAN_ID"
+  # ifup of a VLAN sub-interface first brings up its parent interface unless ifupdown already has it recorded as up; on a machine whose
+  # parent was configured another way that would run its address configuration again. Found on a real kernel: only proceed if ifupdown
+  # itself holds the parent up.
+  command -v ifquery >/dev/null 2>&1 && ifquery --state "$A_IF" >/dev/null 2>&1 || {
+    echo "  $A_IF is not held up by ifupdown here (ifquery --state says it is not), and ifup of its VLAN would try to bring it up itself and could disturb its address: set the VLAN up by hand (deploy/server-vlan5.sh)" >&2
+    return 3
+  }
+  # the VLAN's own addresses must not already be somewhere else on this machine
+  for a in "$NCS_VLAN_ADDRESS" $NCS_VLAN_TENANT_ADDRESSES; do
+    if ip -4 -o addr show 2>/dev/null | awk -v v="$vif" '$2 != v {print $4}' | grep -qx "$a/$NCS_VLAN_PREFIX"; then echo "  $a is already on another interface of this machine: nothing was changed" >&2; return 1; fi
+  done
+
+  file="$(p "$(vlan_file)")"
+  d="$(p "$ADDR_DIR")/vlan"; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
+  addr_snapshot "$d"
+  existing=0; [ -f "$file" ] && { cp -p "$file" "$d/previous"; existing=1; }
+  cat >"$d/rollback.sh" <<ROLLBACK
+#!/bin/sh
+# Take the tenant VLAN off the machine again. Run by the safety timer, or at once if the change could not be proved to work.
+PATH="\$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+echo "nuit-cloud: undoing the tenant VLAN change"
+ifdown --force $vif 2>/dev/null
+if [ "$existing" = 1 ]; then cp -p "$d/previous" "$file"; else rm -f "$file"; fi
+ip link del $vif 2>/dev/null
+if [ -f "$d/before.addrs" ]; then while read -r ifc cidr; do ip addr add "\$cidr" dev "\$ifc" 2>/dev/null; done <"$d/before.addrs"; fi
+if [ -f "$d/before.routes" ]; then while IFS= read -r line; do ip route replace \$line 2>/dev/null; done <"$d/before.routes"; fi
+rm -f "$d/armed"
+exit 0
+ROLLBACK
+  chmod 700 "$d/rollback.sh"
+  systemd-run --quiet --unit=nuit-cloud-vlan-rollback --collect --on-active="${ADDR_ROLLBACK_SECONDS}s" /bin/sh "$d/rollback.sh" || { echo "  could not arm the safety timer; nothing was changed" >&2; return 1; }
+  : >"$d/armed"
+
+  mkdir -p "$(dirname "$file")"
+  vlan_render "$A_IF" >"$file"
+  [ -e "$(p /etc/modules-load.d/8021q.conf)" ] || { mkdir -p "$(p /etc/modules-load.d)"; echo 8021q >"$(p /etc/modules-load.d/8021q.conf)"; }   # load the VLAN module at boot
+  systemctl restart systemd-modules-load.service >/dev/null 2>&1 || true   # the agent's own sandbox may not load modules; systemd can
+  if ! ifup "$vif" >"$d/ifup.out" 2>&1; then
+    sh "$d/rollback.sh"
+    echo "  ifup $vif failed ($(tr '\n' ' ' <"$d/ifup.out" | cut -c1-200)), so the machine was put back" >&2
+    return 1
+  fi
+
+  # nothing that was there may be gone, and the platform must still be reachable
+  if ! addr_lost "$d" ""; then
+    addr_heal "$d"
+    if ! addr_lost "$d" ""; then
+      lost_list="$(tr '\n' ';' <"$d/lost")"
+      sh "$d/rollback.sh"
+      echo "  the change would have lost other network configuration ($lost_list), so the machine was put back" >&2
+      return 1
+    fi
+  fi
+  proved=0
+  if [ -n "${NCS_PLATFORM_URL:-}" ]; then
+    for _ in 1 2 3 4 5 6; do
+      if curl -fsS --max-time 15 -o /dev/null "$NCS_PLATFORM_URL/api/agent/download/VERSION" 2>/dev/null; then proved=1; break; fi
+      sleep 5
+    done
+  else
+    ping -c 2 -W 3 "$A_GW" >/dev/null 2>&1 && proved=1
+  fi
+  if [ "$proved" != 1 ]; then
+    sh "$d/rollback.sh"
+    echo "  the platform could not be reached after the change, so the machine was put back" >&2
+    return 1
+  fi
+  systemctl stop nuit-cloud-vlan-rollback.timer >/dev/null 2>&1 || true
+  rm -f "$d/armed"
+  if ping -c 2 -W 2 -I "$vif" "$NCS_VLAN_GATEWAY" >/dev/null 2>&1; then
+    echo "  $vif carries $NCS_VLAN_ADDRESS and the tenant block; the VLAN gateway $NCS_VLAN_GATEWAY answers"
+  else
+    echo "  $vif carries $NCS_VLAN_ADDRESS and the tenant block. Note: the VLAN gateway $NCS_VLAN_GATEWAY did not answer yet; the VLAN is assumed to reach this port, so this is left in place"
+  fi
+}

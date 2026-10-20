@@ -121,6 +121,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		}
 		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
 	}
+	if raw, ok := task.Params["vlan"].(map[string]any); ok {
+		vlanEnv, err := vlanEnvironment(raw, r.PlatformURL)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		env = append(env, vlanEnv...)
+	}
 	if raw, ok := task.Params["runtime"].(map[string]any); ok && apply {
 		if r.Runtime == nil {
 			return client.Report{Status: "failed", ExitCode: &one, Output: "this agent cannot install the runtime"}
@@ -277,4 +284,51 @@ func (r Runner) scan(ctx context.Context, task *taskverify.Task) client.Report {
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("scanned %d addresses from %s (%s): %d answered", res.Scanned, res.From, res.Method, len(res.Answered)), Result: res}
+}
+
+// vlanEnvironment turns the signed VLAN slice into what the profile scripts read, after checking every part is what it should be.
+func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
+	number := func(k string, lo, hi float64) (string, error) {
+		f, ok := raw[k].(float64)
+		if !ok || f != float64(int(f)) || f < lo || f > hi {
+			return "", fmt.Errorf("the VLAN %s is not a whole number from %v to %v", k, lo, hi)
+		}
+		return fmt.Sprintf("%d", int(f)), nil
+	}
+	address := func(v any) (string, error) {
+		s, _ := v.(string)
+		if !ipv4.MatchString(s) || net.ParseIP(s) == nil {
+			return "", fmt.Errorf("%q is not an IPv4 address", s)
+		}
+		return s, nil
+	}
+	id, err := number("id", 1, 4094)
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := number("prefix", 16, 30)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := address(raw["address"])
+	if err != nil {
+		return nil, fmt.Errorf("the VLAN address: %w", err)
+	}
+	gateway, err := address(raw["gateway"])
+	if err != nil {
+		return nil, fmt.Errorf("the VLAN gateway: %w", err)
+	}
+	list, _ := raw["tenantAddresses"].([]any)
+	if len(list) < 1 || len(list) > 32 {
+		return nil, errors.New("the VLAN carries 1 to 32 tenant addresses")
+	}
+	var tenants []string
+	for _, v := range list {
+		a, err := address(v)
+		if err != nil {
+			return nil, fmt.Errorf("a tenant address: %w", err)
+		}
+		tenants = append(tenants, a)
+	}
+	return []string{"NCS_VLAN_ID=" + id, "NCS_VLAN_PREFIX=" + prefix, "NCS_VLAN_ADDRESS=" + addr, "NCS_VLAN_GATEWAY=" + gateway, "NCS_VLAN_TENANT_ADDRESSES=" + strings.Join(tenants, " "), "NCS_PLATFORM_URL=" + platformURL}, nil
 }

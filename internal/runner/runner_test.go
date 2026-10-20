@@ -376,3 +376,32 @@ func TestAnAddressScanReportsWhatAnswered(t *testing.T) {
 		t.Errorf("%+v", rep)
 	}
 }
+
+func TestTheVLANSliceReachesTheScriptsAsEnvironmentAndBadPartsAreRefused(t *testing.T) {
+	good := func() map[string]any {
+		return map[string]any{"id": float64(5), "address": "10.20.0.18", "prefix": float64(24), "gateway": "10.20.0.1", "tenantAddresses": []any{"10.20.0.19", "10.20.0.20"}}
+	}
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_vlan", Status: "applied"}}}}
+	r := withProfiles(f)
+	r.PlatformURL = "https://agent.example"
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-vlan", "vlan": good()}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || strings.Join(f.env, "|") != "NCS_VLAN_ID=5|NCS_VLAN_PREFIX=24|NCS_VLAN_ADDRESS=10.20.0.18|NCS_VLAN_GATEWAY=10.20.0.1|NCS_VLAN_TENANT_ADDRESSES=10.20.0.19 10.20.0.20|NCS_PLATFORM_URL=https://agent.example" {
+		t.Errorf("%+v env=%v", rep, f.env)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"id":         func(m map[string]any) { m["id"] = float64(5000) },
+		"prefix":     func(m map[string]any) { m["prefix"] = float64(8) },
+		"address":    func(m map[string]any) { m["address"] = "10.20.0.18; reboot" },
+		"gateway":    func(m map[string]any) { m["gateway"] = "fe80::1" },
+		"no tenant":  func(m map[string]any) { m["tenantAddresses"] = []any{} },
+		"bad tenant": func(m map[string]any) { m["tenantAddresses"] = []any{"10.20.0.19", "$(id)"} },
+	} {
+		v := good()
+		mutate(v)
+		f2 := &fakeProfiles{}
+		task.Params["vlan"] = v
+		if rep := withProfiles(f2).Run(context.Background(), task); rep.Status != "failed" || len(f2.calls) != 0 {
+			t.Errorf("%s: %+v calls=%v", name, rep, f2.calls)
+		}
+	}
+}
