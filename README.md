@@ -25,29 +25,27 @@ nuit-cloud-agent survey     # read this machine and print what the platform woul
 
 The agent keeps its identity in `/var/lib/nuit-cloud-agent/state.json` (mode 0600, root only), written atomically.
 
-## Installing on a machine by hand
+## Installing on a machine
 
-Until the one-command installer exists (it needs an https address for the platform and published, signed releases). On the machine, as root (`su -`):
+The platform serves an installer. On the machine, as root (`su -`), with an enrollment code from the admin portal (Platform tenant > Nuit Cloud Servers > Enrollment codes, which shows these exact commands):
 
 ```
-# 1. the binary for the machine's CPU (uname -m: x86_64 = amd64, aarch64 = arm64), copied over, for example with scp
-install -m 0755 nuit-cloud-agent-linux-amd64 /usr/local/bin/nuit-cloud-agent
+apt-get install -y ca-certificates curl        # a bare Debian cannot fetch anything securely without these
+curl -fsSL https://<platform agent address>/api/agent/install.sh | NUIT_CLOUD_ENROLLMENT_CODE=nce_... sh
+```
 
-# 2. the service
-install -m 0644 nuit-cloud-agent.service /etc/systemd/system/nuit-cloud-agent.service
+It downloads the build for the machine's CPU from the platform, verifies its SHA-256, installs it with a systemd unit, enrols, and starts it. Re-running it is safe.
 
-# 3. enrol with a code from the admin portal (Platform tenant > Nuit Cloud Servers > Enrollment codes).
-#    The portal shows this exact command. --insecure-http is needed only while the platform has no https address.
+### By hand (a trusted test network without https)
+
+```
+install -m 0755 nuit-cloud-agent-linux-amd64 /usr/local/bin/nuit-cloud-agent          # uname -m: x86_64 = amd64, aarch64 = arm64
+install -m 0644 deploy/nuit-cloud-agent.service /etc/systemd/system/
 nuit-cloud-agent enroll --url http://<platform address>:4173 --code nce_... --insecure-http
-
-# 4. start it. On a plain-http test network the service needs the same allowance:
 mkdir -p /etc/systemd/system/nuit-cloud-agent.service.d
 printf '[Service]\nEnvironment=NUIT_CLOUD_AGENT_INSECURE_HTTP=1\n' > /etc/systemd/system/nuit-cloud-agent.service.d/insecure-http.conf
 systemctl daemon-reload && systemctl enable --now nuit-cloud-agent
-journalctl -u nuit-cloud-agent -f      # it should say it is calling the platform
 ```
-
-The machine appears in the portal as soon as it enrols. Then run **Survey now** on its page.
 
 ## Development
 
