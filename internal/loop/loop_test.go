@@ -43,7 +43,9 @@ type fakePlatform struct {
 	offer   []taskverify.Envelope
 	checkIn error
 	failFor map[string]error // task id -> error for ReportTask
-	reports []reported
+	// tooLargeWhenResult makes the platform answer 413 to any report that carries findings.
+	tooLargeWhenResult bool
+	reports            []reported
 }
 
 func (p *fakePlatform) CheckIn(context.Context) (*client.CheckInResponse, error) {
@@ -60,6 +62,9 @@ func (p *fakePlatform) ReportTask(_ context.Context, id string, r client.Report)
 	defer p.mu.Unlock()
 	if err := p.failFor[id]; err != nil {
 		return err
+	}
+	if p.tooLargeWhenResult && r.Result != nil {
+		return &client.StatusError{Status: 413, Message: "Request body too large"}
 	}
 	p.reports = append(p.reports, reported{id, r})
 	return nil
@@ -295,4 +300,49 @@ func TestRunStopsWhenAskedAndWaitsForARunningTask(t *testing.T) {
 	if len(r.ran) != 1 {
 		t.Errorf("the running task should have been allowed to finish: %v", r.ran)
 	}
+}
+
+func TestAReportThePlatformSaysIsTooLargeIsResentWithoutItsFindingsSoTheTaskDoesNotHang(t *testing.T) {
+	l, p, _, v := setup(t)
+	r := &bigResultRunner{}
+	l.Runner = r
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	p.tooLargeWhenResult = true
+	_, _ = l.Once(context.Background())
+	l.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	last := p.reports[len(p.reports)-1]
+	if last.Report.Status != "done" || last.Report.Result != nil {
+		t.Errorf("the final report should arrive without findings: %+v", last.Report)
+	}
+}
+
+type bigResultRunner struct{}
+
+func (bigResultRunner) Names() []string { return []string{"ping"} }
+func (bigResultRunner) Run(context.Context, *taskverify.Task) client.Report {
+	zero := 0
+	return client.Report{Status: "done", ExitCode: &zero, Output: "ok", Result: map[string]string{"big": "yes"}}
+}
+
+func TestLongOutputIsCutBeforeItIsSent(t *testing.T) {
+	l, p, _, v := setup(t)
+	l.Runner = &longOutputRunner{}
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	_, _ = l.Once(context.Background())
+	l.Wait()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	final := p.reports[len(p.reports)-1].Report.Output
+	if len(final) > maxReportOutput+100 || len(final) < 1000 {
+		t.Errorf("sent %d bytes", len(final))
+	}
+}
+
+type longOutputRunner struct{}
+
+func (longOutputRunner) Names() []string { return []string{"ping"} }
+func (longOutputRunner) Run(context.Context, *taskverify.Task) client.Report {
+	return client.Report{Status: "done", Output: string(make([]byte, 500*1024))}
 }

@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/taskverify"
 )
@@ -140,13 +142,24 @@ func (l *Loop) start(ctx context.Context, task *taskverify.Task) bool {
 	return true
 }
 
+// maxReportOutput is how much of a task's output is sent: the platform keeps 64 KB, so sending more is only waste.
+const maxReportOutput = 60 * 1024
+
 func (l *Loop) report(ctx context.Context, id string, r client.Report) {
+	r.Output = profiles.Truncate(r.Output, maxReportOutput)
 	var err error
 	for attempt := 1; attempt <= reportAttempts; attempt++ {
 		if err = l.Platform.ReportTask(ctx, id, r); err == nil {
 			return
 		}
 		var se *client.StatusError
+		if errors.As(err, &se) && se.Status == http.StatusRequestEntityTooLarge && r.Result != nil {
+			// Too big for the platform: send what matters without the findings, so the task does not hang until it times out.
+			l.logf("the report for task %s was too large; sending it without its findings", id)
+			r.Result = nil
+			r.Output = profiles.Truncate(r.Output, maxReportOutput/2) + "\n(the findings were too large to send)"
+			continue
+		}
 		if errors.As(err, &se) && se.Status >= 400 && se.Status < 500 {
 			break // the platform said no; asking again will not change that
 		}

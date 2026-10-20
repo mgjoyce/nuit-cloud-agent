@@ -18,6 +18,7 @@ import (
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/survey"
@@ -44,6 +45,8 @@ func main() {
 		err = status(args)
 	case "survey":
 		err = surveyCmd()
+	case "profile-check":
+		err = profileCheck(args)
 	case "version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -69,6 +72,8 @@ func usage() {
         Show who this machine is on the platform (never the credential).
   survey
         Read this machine and print what the platform would be told. Changes nothing.
+  profile-check <profile>
+        Compare this machine with a profile and print the result as JSON. Changes nothing.
   version
 `)
 }
@@ -141,8 +146,12 @@ func run(args []string) error {
 	l := &loop.Loop{
 		State:    st,
 		Platform: c,
-		Runner:   runner.Runner{Version: version, Survey: func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) }},
-		Log:      logger.Printf,
+		Runner: runner.Runner{
+			Version:  version,
+			Survey:   func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
+			Profiles: profiles.Runner{},
+		},
+		Log: logger.Printf,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -170,6 +179,22 @@ func status(args []string) error {
 
 func surveyCmd() error {
 	out, err := json.MarshalIndent(survey.Collect(context.Background(), survey.Real()), "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+func profileCheck(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: nuit-cloud-agent profile-check <profile> (this agent carries: %s)", strings.Join(profiles.Runner{}.Names(), ", "))
+	}
+	res, _, err := profiles.Runner{}.Run(context.Background(), args[0], false)
+	if err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(res, "", "  ")
 	if err != nil {
 		return err
 	}

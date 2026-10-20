@@ -17,3 +17,13 @@ build:
 
 clean:
 	rm -rf dist
+
+# The profile features ship inside the agent's release (ADR 0001: a task names a feature, never fetches a script). They are
+# written in the platform repository, deploy/bootstrap; this copies the ones the platform asks for into the agent.
+BOOTSTRAP_SRC ?= ../nuit-cloud/deploy/bootstrap
+.PHONY: sync-bootstrap
+sync-bootstrap:
+	rm -rf internal/profiles/bootstrap
+	mkdir -p internal/profiles/bootstrap/profiles
+	cp $(BOOTSTRAP_SRC)/bootstrap.sh $(BOOTSTRAP_SRC)/features.sh internal/profiles/bootstrap/
+	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh internal/profiles/bootstrap/profiles/
