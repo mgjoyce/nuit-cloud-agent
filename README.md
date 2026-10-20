@@ -61,3 +61,7 @@ make build     # static binaries in dist/ (VERSION=1.2.3 to set the version)
 ## Status
 
 Version 0.2.x. Built: enrolment, check-in, signed-task verification, `ping`, `survey`, `profile-check`, `profile-apply`. Not yet built: self-update, signed releases, and automatic credential rotation. See the tickets in the platform repository under the epic "Commission a Nuit Cloud Server from the admin portal".
+
+## License
+
+MIT. See LICENSE.
