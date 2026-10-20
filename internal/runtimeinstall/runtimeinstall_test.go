@@ -27,11 +27,11 @@ func server(t *testing.T, files map[string]string) *httptest.Server {
 }
 
 func params(bundle, containerd string) Params {
-	return Params{BundleVersion: "v4", BundleSHA256: sum(bundle), ContainerdVersion: "2.2.10", ContainerdSHA256: sum(containerd), RootFingerprint: strings.Repeat("a", 64)}
+	return Params{BundleVersion: "v4", BundleSHA256: sum(bundle), ContainerdVersion: "2.2.10", ContainerdSHA256: sum(containerd), CrictlVersion: "1.37.0", CrictlSHA256: sum("crictl bytes"), RootFingerprint: strings.Repeat("a", 64)}
 }
 
 func TestStageChecksBothFilesAndHandsOverTheirPaths(t *testing.T) {
-	srv := server(t, map[string]string{BundleFile: "bundle bytes", ContainerdFile: "containerd bytes"})
+	srv := server(t, map[string]string{BundleFile: "bundle bytes", ContainerdFile: "containerd bytes", CrictlFile: "crictl bytes"})
 	defer srv.Close()
 	env, cleanup, err := Stager{BaseURL: srv.URL, Dir: t.TempDir()}.Stage(context.Background(), params("bundle bytes", "containerd bytes"))
 	if err != nil {
@@ -43,7 +43,12 @@ func TestStageChecksBothFilesAndHandsOverTheirPaths(t *testing.T) {
 			t.Errorf("environment lacks %q:\n%s", want, joined)
 		}
 	}
-	path := strings.TrimPrefix(strings.Split(env[0], "=")[1], "")
+	var path string
+	for _, e := range env {
+		if strings.HasPrefix(e, "NCS_RUNTIME_BUNDLE=") {
+			path = strings.TrimPrefix(e, "NCS_RUNTIME_BUNDLE=")
+		}
+	}
 	if b, _ := os.ReadFile(path); string(b) != "bundle bytes" {
 		t.Errorf("the staged bundle holds %q", b)
 	}
@@ -54,7 +59,7 @@ func TestStageChecksBothFilesAndHandsOverTheirPaths(t *testing.T) {
 }
 
 func TestStageRefusesAFileThatDoesNotMatchTheSignedChecksumAndLeavesNothing(t *testing.T) {
-	srv := server(t, map[string]string{BundleFile: "tampered", ContainerdFile: "containerd bytes"})
+	srv := server(t, map[string]string{BundleFile: "tampered", ContainerdFile: "containerd bytes", CrictlFile: "crictl bytes"})
 	defer srv.Close()
 	dir := t.TempDir()
 	_, _, err := Stager{BaseURL: srv.URL, Dir: dir}.Stage(context.Background(), params("bundle bytes", "containerd bytes"))
@@ -75,7 +80,7 @@ func TestStageFailsWhenThePlatformHasNoFile(t *testing.T) {
 }
 
 func TestParseParamsIsStrict(t *testing.T) {
-	good := map[string]any{"bundleVersion": "v4", "bundleSha256": strings.Repeat("b", 64), "containerdVersion": "2.2.10", "containerdSha256": strings.Repeat("c", 64), "rootFingerprint": strings.Repeat("d", 64)}
+	good := map[string]any{"bundleVersion": "v4", "bundleSha256": strings.Repeat("b", 64), "containerdVersion": "2.2.10", "containerdSha256": strings.Repeat("c", 64), "crictlVersion": "1.37.0", "crictlSha256": strings.Repeat("e", 64), "rootFingerprint": strings.Repeat("d", 64)}
 	if _, err := ParseParams(good); err != nil {
 		t.Fatal(err)
 	}

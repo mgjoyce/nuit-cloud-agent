@@ -252,7 +252,7 @@ func (f *fakeStager) Stage(_ context.Context, _ runtimeinstall.Params) ([]string
 func runtimeTask(name string) *taskverify.Task {
 	hex := func(c string) string { return strings.Repeat(c, 64) }
 	return &taskverify.Task{Name: name, TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-container-service", "runtime": map[string]any{
-		"bundleVersion": "v4", "bundleSha256": hex("a"), "containerdVersion": "2.2.10", "containerdSha256": hex("b"), "rootFingerprint": hex("c"),
+		"bundleVersion": "v4", "bundleSha256": hex("a"), "containerdVersion": "2.2.10", "containerdSha256": hex("b"), "crictlVersion": "1.37.0", "crictlSha256": hex("d"), "rootFingerprint": hex("c"),
 	}}}
 }
 

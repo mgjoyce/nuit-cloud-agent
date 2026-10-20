@@ -25,11 +25,13 @@ import (
 const (
 	BundleFile     = "oci-saas-bundle.tar.gz"
 	ContainerdFile = "containerd.tar.gz"
+	CrictlFile     = "crictl.tar.gz"
 )
 
 const (
 	maxBundleBytes     = 512 << 20
 	maxContainerdBytes = 128 << 20
+	maxCrictlBytes     = 64 << 20
 )
 
 var (
@@ -43,6 +45,8 @@ type Params struct {
 	BundleSHA256      string
 	ContainerdVersion string
 	ContainerdSHA256  string
+	CrictlVersion     string
+	CrictlSHA256      string
 	RootFingerprint   string
 }
 
@@ -52,14 +56,15 @@ func ParseParams(raw map[string]any) (Params, error) {
 	p := Params{
 		BundleVersion: str("bundleVersion"), BundleSHA256: str("bundleSha256"),
 		ContainerdVersion: str("containerdVersion"), ContainerdSHA256: str("containerdSha256"),
+		CrictlVersion: str("crictlVersion"), CrictlSHA256: str("crictlSha256"),
 		RootFingerprint: str("rootFingerprint"),
 	}
-	for _, v := range []string{p.BundleVersion, p.ContainerdVersion} {
+	for _, v := range []string{p.BundleVersion, p.ContainerdVersion, p.CrictlVersion} {
 		if !version.MatchString(v) {
 			return Params{}, fmt.Errorf("the runtime parameters carry no usable version (%q)", v)
 		}
 	}
-	for name, v := range map[string]string{"bundle": p.BundleSHA256, "containerd": p.ContainerdSHA256, "root fingerprint": p.RootFingerprint} {
+	for name, v := range map[string]string{"bundle": p.BundleSHA256, "containerd": p.ContainerdSHA256, "crictl": p.CrictlSHA256, "root fingerprint": p.RootFingerprint} {
 		if !hexSHA256.MatchString(v) {
 			return Params{}, fmt.Errorf("the %s checksum is not a SHA-256", name)
 		}
@@ -96,7 +101,13 @@ func (s Stager) Stage(ctx context.Context, p Params) (env []string, cleanup func
 		cleanup()
 		return nil, nil, err
 	}
+	crictl, err := s.fetch(ctx, CrictlFile, filepath.Join(dir, CrictlFile), p.CrictlSHA256, maxCrictlBytes)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
 	return []string{
+		"NCS_CRICTL_TARBALL=" + crictl,
 		"NCS_RUNTIME_BUNDLE=" + bundle,
 		"NCS_RUNTIME_BUNDLE_SHA256=" + p.BundleSHA256,
 		"NCS_RUNTIME_ROOT_FINGERPRINT=" + p.RootFingerprint,

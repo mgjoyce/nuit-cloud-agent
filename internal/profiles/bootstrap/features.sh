@@ -203,6 +203,7 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 #   NCS_RUNTIME_ROOT_FINGERPRINT  the fingerprint of the root key the bundle's keys must chain to. artifacts.pub comes from the
 #                                 bundle, so checking the guest artifacts against it alone would be circular: this pins the anchor
 #   NCS_CONTAINERD_TARBALL        the pinned official containerd 2.x release (Debian's own package is 1.7)
+#   NCS_CRICTL_TARBALL            the pinned crictl release (Debian 13 has no cri-tools package)
 # Run by hand without them, the feature says what is missing. The first install gives the node the bundle's initial policy, which
 # admits namespace nuit-cloud-platform only; the platform's hourly policy-sync replaces it once the node is a registered pool host.
 OCISAAS_ETC="${OCISAAS_ETC:-/etc/oci-saas}"
@@ -220,7 +221,7 @@ root_fingerprint_of() { # root_fingerprint_of <artifacts.pub>
 }
 
 f_oci_saas_runtime_do() {
-  if [ -z "${NCS_RUNTIME_BUNDLE:-}" ] || [ -z "${NCS_CONTAINERD_TARBALL:-}" ] || [ -z "${NCS_RUNTIME_ROOT_FINGERPRINT:-}" ]; then
+  if [ -z "${NCS_RUNTIME_BUNDLE:-}" ] || [ -z "${NCS_CONTAINERD_TARBALL:-}" ] || [ -z "${NCS_CRICTL_TARBALL:-}" ] || [ -z "${NCS_RUNTIME_ROOT_FINGERPRINT:-}" ]; then
     echo "  the runtime comes from the oci-saas bundle: ask for this profile from the platform, which gives the agent the bundle, containerd and the root fingerprint to check it against" >&2; return 3
   fi
   [ -f "$NCS_RUNTIME_BUNDLE" ] && [ -f "$NCS_CONTAINERD_TARBALL" ] || { echo "  the bundle or the containerd tarball is not where the agent said it put it" >&2; return 1; }
@@ -234,7 +235,7 @@ f_oci_saas_runtime_do() {
     echo "  /usr/bin/containerd is $have; the runtime needs 2.x and will not replace another service's containerd: a person decides" >&2; return 3
   fi
 
-  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins cri-tools xxd || return 1
+  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd || return 1
 
   work="$(mktemp -d)"
   tar -xzf "$NCS_RUNTIME_BUNDLE" -C "$work" || { rm -rf "$work"; echo "  the bundle is not a readable tarball" >&2; return 1; }
@@ -249,6 +250,12 @@ f_oci_saas_runtime_do() {
   if [ -z "$have" ]; then
     tar -xzf "$NCS_CONTAINERD_TARBALL" -C "$work" bin/containerd || { rm -rf "$work"; echo "  could not unpack containerd" >&2; return 1; }
     install -m 0755 "$work/bin/containerd" "$(p /usr/bin/containerd)"
+  fi
+
+  if [ ! -x "$(p /usr/local/bin/crictl)" ] && ! command -v crictl >/dev/null 2>&1; then
+    work2="$(mktemp -d)"
+    tar -xzf "$NCS_CRICTL_TARBALL" -C "$work2" crictl || { rm -rf "$work" "$work2"; echo "  could not unpack crictl" >&2; return 1; }
+    install -m 0755 "$work2/crictl" "$(p /usr/local/bin/crictl)"; rm -rf "$work2"
   fi
 
   # first install: the bundle's own policy; every later run keeps the policy the platform has published and restarts
