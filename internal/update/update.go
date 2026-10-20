@@ -263,6 +263,12 @@ func (g Guard) Confirm() {
 	}
 }
 
+// Unconfirmed reports whether this version is an update that has not yet proved itself.
+func (g Guard) Unconfirmed() bool {
+	p := g.State.Pending()
+	return p != nil && p.To == g.Version
+}
+
 // Overdue reports whether an unconfirmed update has had its time (ConfirmWithin) and not checked in.
 func (g Guard) Overdue(now time.Time) bool {
 	p := g.State.Pending()

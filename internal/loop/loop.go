@@ -40,6 +40,8 @@ type Guard interface {
 	Started() bool
 	// Confirm is called after a successful check-in.
 	Confirm()
+	// Unconfirmed reports whether the running version is an update that has not yet proved itself.
+	Unconfirmed() bool
 	// Overdue reports whether an unconfirmed update has run out of time.
 	Overdue(now time.Time) bool
 	// Rollback puts the previous build back.
@@ -224,6 +226,9 @@ func (l *Loop) Run(ctx context.Context) {
 				next = maxBackoff
 			} else {
 				next = backoff(failures)
+				if l.Guard != nil && l.Guard.Unconfirmed() {
+					next = defaultInterval // an update that cannot check in is on the clock: keep trying, and keep watching the clock
+				}
 				l.logf("could not reach the platform (%v); trying again in %v", err, next)
 			}
 		} else {

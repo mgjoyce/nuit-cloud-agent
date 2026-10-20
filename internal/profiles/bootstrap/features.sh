@@ -197,7 +197,7 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 
 # The runtime itself (a dedicated containerd, the shim, the CNI bridge) comes from the signed bundle of the oci-saas work; the
 # installer for it is not built yet (ticket #39), so until it is this says what is missing.
-f_oci_saas_runtime_ok() { [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet oci-saas-containerd; }
+f_oci_saas_runtime_ok() { [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas; }
 f_oci_saas_runtime_do() { echo "  install the Nuit Container Service runtime from the signed bundle (INSTALL.txt inside it); automating that is ticket #39" >&2; return 3; }
 
 # Tenants' volumes are disk images under the runtime's directory (default /var/lib/oci-saas) and need room to grow. If the

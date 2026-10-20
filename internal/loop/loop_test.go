@@ -351,6 +351,7 @@ type fakeGuard struct {
 	mu          sync.Mutex
 	started     bool
 	overdue     bool
+	unconfirmed bool
 	confirmed   int
 	rolledBack  int
 	rollbackErr error
@@ -358,6 +359,11 @@ type fakeGuard struct {
 
 func (g *fakeGuard) Started() bool { g.mu.Lock(); defer g.mu.Unlock(); return g.started }
 func (g *fakeGuard) Confirm()      { g.mu.Lock(); g.confirmed++; g.mu.Unlock() }
+func (g *fakeGuard) Unconfirmed() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.unconfirmed
+}
 func (g *fakeGuard) Overdue(time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -471,5 +477,32 @@ func TestARollbackThatFailsStillStopsTheLoop(t *testing.T) {
 	l.Run(context.Background())
 	if g.rolledBack != 1 || !restarted {
 		t.Errorf("rolledBack=%d restarted=%v", g.rolledBack, restarted)
+	}
+}
+
+func TestWhileAnUpdateIsUnconfirmedAFailedCheckInIsRetriedEveryThirtySecondsNotBackedOff(t *testing.T) {
+	waits := func(unconfirmed bool) []time.Duration {
+		l, p, _, _ := setup(t)
+		l.Guard = &fakeGuard{unconfirmed: unconfirmed}
+		p.checkIn = errors.New("cannot reach the platform")
+		var got []time.Duration
+		ctx, cancel := context.WithCancel(context.Background())
+		l.Sleep = func(_ context.Context, d time.Duration) {
+			got = append(got, d)
+			if len(got) == 5 {
+				cancel()
+			}
+		}
+		l.Run(ctx)
+		return got
+	}
+	normal := waits(false)
+	if normal[4] < 4*time.Minute {
+		t.Fatalf("the ordinary back-off should grow: %v", normal)
+	}
+	for _, d := range waits(true) {
+		if d > 40*time.Second {
+			t.Errorf("an unconfirmed update must keep retrying about every 30s, waited %v", d)
+		}
 	}
 }
