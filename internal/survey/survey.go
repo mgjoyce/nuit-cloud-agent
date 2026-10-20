@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -102,8 +103,12 @@ type Time struct {
 }
 
 type SSH struct {
-	PermitRootLogin        string `json:"permitRootLogin"` // as configured, or "" when not set (the daemon's own default applies)
+	PermitRootLogin        string `json:"permitRootLogin"` // what sshd uses (or, from the file, as configured); "" when unknown
 	PasswordAuthentication string `json:"passwordAuthentication"`
+	// Source says where the two values come from: "effective" is `sshd -T`, what sshd will use after merging the main file, its
+	// included files and its defaults; "file" is only what /etc/ssh/sshd_config says (a setting made elsewhere, or left to the
+	// default, is then ""); empty when neither could be read.
+	Source string `json:"source,omitempty"`
 }
 
 // Sources are where the survey reads from, so a test can point it at fixtures.
@@ -216,9 +221,7 @@ func Collect(ctx context.Context, s Sources) Report {
 	}
 	r.Network = collectNetwork(s, problem)
 	r.Time = collectTime(ctx, s)
-	if text, err := s.read("/etc/ssh/sshd_config"); err == nil {
-		r.SSH = ParseSSHDConfig(text)
-	}
+	r.SSH = collectSSH(ctx, s, problem)
 	return r
 }
 
@@ -450,6 +453,31 @@ func collectTime(ctx context.Context, s Sources) Time {
 		return Time{Synchronized: &v}
 	}
 	return Time{}
+}
+
+// collectSSH asks sshd what it will use (`sshd -T`: the main file, its included files and the defaults, merged as sshd merges
+// them). Without it only the main file's text is read, which misses a setting made in sshd_config.d/ or left to the default.
+func collectSSH(ctx context.Context, s Sources, problem func(string, error)) SSH {
+	for _, binary := range []string{"sshd", "/usr/sbin/sshd"} {
+		out, err := s.Run(ctx, binary, "-T")
+		if err != nil {
+			continue
+		}
+		c := ParseSSHDConfig(out)
+		if c.PermitRootLogin != "" || c.PasswordAuthentication != "" {
+			c.Source = "effective"
+			return c
+		}
+	}
+	var c SSH
+	if text, err := s.read("/etc/ssh/sshd_config"); err == nil {
+		c = ParseSSHDConfig(text)
+		c.Source = "file"
+		problem("sshd -T", errors.New("could not ask sshd what it uses, so the SSH settings are only what /etc/ssh/sshd_config says"))
+	} else {
+		problem("sshd_config", err)
+	}
+	return c
 }
 
 // ParseSSHDConfig reads the settings that matter for hardening from sshd_config; an unset one is "".

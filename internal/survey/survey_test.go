@@ -102,6 +102,9 @@ func TestCollectReportsAWirelessMachineAsWireless(t *testing.T) {
 			if name == "timedatectl" {
 				return "yes\n", nil
 			}
+			if name == "sshd" { // the effective settings: a file in sshd_config.d turned passwords off
+				return "port 22\npermitrootlogin without-password\npasswordauthentication no\n", nil
+			}
 			return "", errors.New("unexpected command " + name)
 		},
 		Now:      func() time.Time { return time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC) },
@@ -147,7 +150,7 @@ func TestCollectReportsAWirelessMachineAsWireless(t *testing.T) {
 	if r.Network.DefaultRoute == nil || r.Network.DefaultRoute.Interface != "wlp2s0" || r.Network.DefaultRoute.Gateway != "192.168.1.1" {
 		t.Errorf("route: %+v", r.Network.DefaultRoute)
 	}
-	if r.Time.Synchronized == nil || !*r.Time.Synchronized || r.SSH.PermitRootLogin != "no" {
+	if r.Time.Synchronized == nil || !*r.Time.Synchronized || r.SSH.PermitRootLogin != "without-password" || r.SSH.PasswordAuthentication != "no" || r.SSH.Source != "effective" {
 		t.Errorf("time/ssh: %+v %+v", r.Time, r.SSH)
 	}
 }
@@ -203,5 +206,54 @@ func TestTheInterruptControllerIsReadFromProcInterrupts(t *testing.T) {
 		if got := ParseInterruptController(text); got != want {
 			t.Errorf("%q: got %q, want %q", text, got, want)
 		}
+	}
+}
+
+func sshSources(t *testing.T, config string, run func(string) (string, error)) Sources {
+	t.Helper()
+	root := t.TempDir()
+	if config != "" {
+		_ = os.MkdirAll(filepath.Join(root, "etc/ssh"), 0o755)
+		if err := os.WriteFile(filepath.Join(root, "etc/ssh/sshd_config"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return Sources{Root: root, Run: func(_ context.Context, name string, _ ...string) (string, error) { return run(name) }}
+}
+
+func TestTheSSHSettingsAreWhatSshdWillUseNotJustWhatTheFileSays(t *testing.T) {
+	// the file says nothing; the defaults and an included file decide
+	s := sshSources(t, "# Include /etc/ssh/sshd_config.d/*.conf\n", func(name string) (string, error) {
+		return "permitrootlogin no\npasswordauthentication no\npubkeyauthentication yes\n", nil
+	})
+	got := collectSSH(context.Background(), s, func(string, error) {})
+	if got != (SSH{PermitRootLogin: "no", PasswordAuthentication: "no", Source: "effective"}) {
+		t.Errorf("%+v", got)
+	}
+}
+
+func TestWithoutSshdTheFileIsReadAndTheGapIsSaid(t *testing.T) {
+	var problems []string
+	s := sshSources(t, "PermitRootLogin yes\n", func(string) (string, error) { return "", errors.New("not found") })
+	got := collectSSH(context.Background(), s, func(what string, _ error) { problems = append(problems, what) })
+	if got.PermitRootLogin != "yes" || got.Source != "file" || len(problems) != 1 || problems[0] != "sshd -T" {
+		t.Errorf("%+v %v", got, problems)
+	}
+	// neither sshd nor a file: nothing is claimed
+	none := collectSSH(context.Background(), sshSources(t, "", func(string) (string, error) { return "", errors.New("no") }), func(string, error) {})
+	if none != (SSH{}) {
+		t.Errorf("%+v", none)
+	}
+}
+
+func TestSshdTriedByItsAbsolutePathWhenNotOnThePath(t *testing.T) {
+	s := sshSources(t, "", func(name string) (string, error) {
+		if name == "/usr/sbin/sshd" {
+			return "permitrootlogin prohibit-password\npasswordauthentication yes\n", nil
+		}
+		return "", errors.New("not on PATH")
+	})
+	if got := collectSSH(context.Background(), s, func(string, error) {}); got.Source != "effective" || got.PasswordAuthentication != "yes" {
+		t.Errorf("%+v", got)
 	}
 }
