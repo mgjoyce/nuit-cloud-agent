@@ -853,17 +853,28 @@ login_key_ok() { # the key's body (type and base64) is already authorised
   [ -f "$home/.ssh/authorized_keys" ] && awk -v b="$body" '{ if (($1" "$2)==b) f=1 } END { exit f?0:1 }' "$home/.ssh/authorized_keys"
 }
 f_ncs_login_ok() { [ -n "${NCS_PLATFORM_SSH_KEY:-}" ] && f_user_ok && login_key_ok; }
+# The agent's service is sandboxed (ProtectHome=read-only), so the write is done by a transient systemd unit, which is not: it
+# inherits nothing from the agent's mount namespace. Without systemd (and in tests) it runs directly.
+LOGIN_WRITE='home="$1"; user="$2"; grp="$3"; key="$4"; dir="$home/.ssh"; file="$dir/authorized_keys"
+mkdir -p "$dir" || exit 1; chmod 700 "$dir" || exit 1
+[ -f "$file" ] || : >"$file" || exit 1
+body="$(printf "%s" "$key" | awk "{print \$1\" \"\$2}")"
+if ! awk -v b="$body" "{ if ((\$1\" \"\$2)==b) f=1 } END { exit f?0:1 }" "$file"; then
+  if [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l | tr -d " ")" = 0 ]; then echo >>"$file" || exit 1; fi
+  printf "%s\n" "$key" >>"$file" || exit 1
+fi
+chmod 600 "$file" || exit 1
+chown "$user:$grp" "$dir" "$file" 2>/dev/null || [ -n "${ROOT:-}" ]'
 f_ncs_login_do() {
   case "${NCS_PLATFORM_SSH_KEY:-}" in ssh-ed25519\ *) ;; *) echo "  the task carries no ssh-ed25519 public key" >&2; return 3 ;; esac
   case "$NCS_PLATFORM_SSH_KEY" in *'
 '*) echo "  the key must be a single line" >&2; return 3 ;; esac
   f_user_ok || { echo "  the account $NC_USER does not exist: create it first (adduser $NC_USER), then run this again" >&2; return 3; }
-  home="$(login_home)"; ssh_dir="$home/.ssh"; file="$ssh_dir/authorized_keys"
-  grp="$(id -gn "$NC_USER" 2>/dev/null || echo "$NC_USER")"
-  mkdir -p "$ssh_dir"; chmod 700 "$ssh_dir"
-  [ -f "$file" ] || : >"$file"
-  login_key_ok || { [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l | tr -d " ")" = 0 ] && echo >>"$file"; printf '%s\n' "$NCS_PLATFORM_SSH_KEY" >>"$file"; }
-  chmod 600 "$file"
-  chown "$NC_USER:$grp" "$ssh_dir" "$file" 2>/dev/null || [ -n "${ROOT:-}" ]
+  home="$(login_home)"; grp="$(id -gn "$NC_USER" 2>/dev/null || echo "$NC_USER")"
+  if [ -z "${ROOT:-}" ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --quiet --wait --collect --pipe /bin/sh -c "$LOGIN_WRITE" sh "$home" "$NC_USER" "$grp" "$NCS_PLATFORM_SSH_KEY" || return 1
+  else
+    sh -c "$LOGIN_WRITE" sh "$home" "$NC_USER" "$grp" "$NCS_PLATFORM_SSH_KEY" || return 1
+  fi
   echo "  the platform's key is authorised for $NC_USER (other keys left as they were)"
 }
