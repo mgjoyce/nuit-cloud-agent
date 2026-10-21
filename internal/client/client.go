@@ -241,6 +241,30 @@ func (c *Client) do(ctx context.Context, path string, body any, authenticated bo
 	return lastErr
 }
 
+// Do sends a request the way the platform calls are sent: by name first, then, if the connection itself fails, by each fixed
+// fallback address, remembering the route that worked. Meant for the big downloads (a new agent build, the runtime), which
+// must not depend on DNS either. The caller has no per-attempt timeout here: a connection that cannot be made fails fast.
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	for _, route := range c.order() {
+		res, err := c.HTTP.Do(req.Clone(context.WithValue(req.Context(), routeKey{}, route)))
+		if err == nil {
+			c.mu.Lock()
+			c.preferred = route
+			c.mu.Unlock()
+			return res, nil
+		}
+		lastErr = err
+		if req.Context().Err() != nil {
+			break
+		}
+	}
+	c.mu.Lock()
+	c.preferred = 0
+	c.mu.Unlock()
+	return nil, lastErr
+}
+
 func (c *Client) once(ctx context.Context, path string, body any, authenticated bool, out any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {

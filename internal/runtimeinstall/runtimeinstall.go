@@ -21,6 +21,11 @@ import (
 	"time"
 )
 
+// Doer is what sends a download request: the agent's client (which knows the platform's fallback addresses) or a plain http.Client.
+type Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 // Files the platform serves, by name; the agent asks for these and nothing else.
 const (
 	BundleFile     = "oci-saas-bundle.tar.gz"
@@ -75,7 +80,7 @@ func ParseParams(raw map[string]any) (Params, error) {
 // Stager downloads the runtime's files into a directory under the agent's state.
 type Stager struct {
 	BaseURL string
-	HTTP    *http.Client
+	HTTP    Doer
 	// Dir is where staging directories are made (the agent's state directory: /tmp may be a small tmpfs).
 	Dir string
 }

@@ -122,3 +122,19 @@ func TestConnectingToAFixedAddressStillChecksTheCertificateAgainstThePlatformsNa
 		t.Fatalf("the right name through the address should work: %v", err)
 	}
 }
+
+func TestDownloadsFallBackToTheAddressToo(t *testing.T) {
+	allowLoopback(t)
+	srv, hits := platform(t, 200)
+	c, _ := New("http://platform.invalid", "0.0.0", true)
+	c.SetFallbacks([]string{strings.TrimPrefix(srv.URL, "http://")})
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://platform.invalid/api/agent/download/VERSION", nil)
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("download by address failed: %v", err)
+	}
+	res.Body.Close()
+	if hits.Load() != 1 || !strings.HasPrefix(c.Route(), "by address") {
+		t.Errorf("hits %d route %q", hits.Load(), c.Route())
+	}
+}

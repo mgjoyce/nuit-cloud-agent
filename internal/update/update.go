@@ -25,6 +25,11 @@ import (
 	"github.com/mgjoyce/nuit-cloud-agent/internal/state"
 )
 
+// Doer is what sends a download request: the agent's client (which knows the platform's fallback addresses) or a plain http.Client.
+type Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 const (
 	// MaxBuildBytes bounds a download: a build is about 6 MB, so anything near this is wrong.
 	MaxBuildBytes = 100 << 20
@@ -74,7 +79,7 @@ type Outcome struct {
 type Updater struct {
 	// BaseURL is the platform's address; builds are served at BaseURL/api/agent/download/<name>.
 	BaseURL string
-	HTTP    *http.Client
+	HTTP    Doer
 	// ExePath is the running binary, and StateDir the agent's private directory (where the previous binary is kept).
 	ExePath  string
 	StateDir string
