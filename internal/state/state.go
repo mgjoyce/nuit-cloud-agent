@@ -30,6 +30,8 @@ type State struct {
 	EnrolledAt  time.Time        `json:"enrolledAt"`
 	// Seen maps a task id to when the agent started it.
 	Seen map[string]time.Time `json:"seen"`
+	// Fallbacks are fixed addresses (`host:port`) to connect to when the platform's name does not work; the platform names them.
+	Fallbacks []string `json:"fallbacks,omitempty"`
 	// PendingUpdate is set while a freshly installed version has not yet proved itself by checking in (see package update).
 	PendingUpdate *PendingUpdate `json:"pendingUpdate,omitempty"`
 
@@ -152,6 +154,23 @@ func (s *State) SetCredential(credential string) error {
 }
 
 // Pending returns a copy of the pending update, or nil.
+// SetFallbacks remembers the fixed addresses, and writes the state only if they changed.
+func (s *State) SetFallbacks(list []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(list) == len(s.Fallbacks) {
+		same := true
+		for i := range list {
+			same = same && list[i] == s.Fallbacks[i]
+		}
+		if same {
+			return nil
+		}
+	}
+	s.Fallbacks = append([]string(nil), list...)
+	return s.saveLocked()
+}
+
 func (s *State) Pending() *PendingUpdate {
 	s.mu.Lock()
 	defer s.mu.Unlock()

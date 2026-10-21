@@ -61,6 +61,11 @@ type Loop struct {
 	Guard Guard
 	// Restart stops the loop so the service manager can start the agent again (after an update or a rollback).
 	Restart func()
+	// FallbackSink is told the fixed addresses the platform names for reaching it when its name does not work (an empty list clears
+	// them). It is not called when the platform says nothing about them.
+	FallbackSink func(list []string)
+	// Route says how the platform was last reached, for the log.
+	Route func() string
 
 	mu      sync.Mutex
 	running bool
@@ -93,6 +98,9 @@ func (l *Loop) Once(ctx context.Context) (time.Duration, error) {
 	}
 	if l.Guard != nil {
 		l.Guard.Confirm() // a successful check-in is what a new version has to prove
+	}
+	if l.FallbackSink != nil && resp.FallbackAddresses != nil {
+		l.FallbackSink(*resp.FallbackAddresses)
 	}
 	interval := time.Duration(resp.PollIntervalSeconds) * time.Second
 	if interval <= 0 {
@@ -212,6 +220,7 @@ func (l *Loop) Run(ctx context.Context) {
 		l.rollback("it has restarted too many times without proving itself")
 	}
 	failures := 0
+	var outageSince time.Time
 	for ctx.Err() == nil {
 		if l.Guard != nil && l.Guard.Overdue(l.now()) {
 			l.rollback("it could not check in with the platform in time")
@@ -220,6 +229,9 @@ func (l *Loop) Run(ctx context.Context) {
 		next, err := l.Once(ctx)
 		if err != nil {
 			failures++
+			if outageSince.IsZero() {
+				outageSince = l.now()
+			}
 			var se *client.StatusError
 			if errors.As(err, &se) && se.Unauthorized() {
 				l.logf("the platform does not accept this agent (%v); will try again in %v", err, maxBackoff)
@@ -229,10 +241,18 @@ func (l *Loop) Run(ctx context.Context) {
 				if l.Guard != nil && l.Guard.Unconfirmed() {
 					next = defaultInterval // an update that cannot check in is on the clock: keep trying, and keep watching the clock
 				}
-				l.logf("could not reach the platform (%v); trying again in %v", err, next)
+				l.logf("could not reach the platform (%v) for %v; trying again in %v", err, l.now().Sub(outageSince).Round(time.Second), next)
 			}
 		} else {
+			if failures > 0 {
+				route := ""
+				if l.Route != nil {
+					route = ", " + l.Route()
+				}
+				l.logf("reached the platform again after %v%s", l.now().Sub(outageSince).Round(time.Second), route)
+			}
 			failures = 0
+			outageSince = time.Time{}
 		}
 		l.sleep(ctx, jitter(next))
 	}

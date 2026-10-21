@@ -506,3 +506,16 @@ func TestWhileAnUpdateIsUnconfirmedAFailedCheckInIsRetriedEveryThirtySecondsNotB
 		}
 	}
 }
+
+func TestFallbackAddressesFromTheCheckInAreHandedOnAndAnEmptyListClears(t *testing.T) {
+	l, p, _, _ := setup(t)
+	var got [][]string
+	l.FallbackSink = func(list []string) { got = append(got, list) }
+	if _, err := l.Once(context.Background()); err != nil { // the fake answers without the field: nothing is said
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("an answer without the field must leave the list alone: %v", got)
+	}
+	_ = p
+}

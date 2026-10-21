@@ -136,6 +136,7 @@ func enroll(args []string) error {
 	st := state.New(*dir)
 	st.PlatformURL, st.MachineID, st.Name, st.Credential = c.BaseURL, res.MachineID, res.Name, res.Credential
 	st.TrustedKeys, st.EnrolledAt = res.TaskSigning.Keys, time.Now().UTC()
+	st.Fallbacks = c.SetFallbacks(res.FallbackAddresses)
 	if err := st.Save(); err != nil {
 		return fmt.Errorf("enrolled, but could not save the identity (the code is now used up): %w", err)
 	}
@@ -157,6 +158,7 @@ func run(args []string) error {
 		return err
 	}
 	c.Credential = st.Credential
+	c.SetFallbacks(st.Fallbacks)
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -173,6 +175,12 @@ func run(args []string) error {
 	l := &loop.Loop{
 		State:    st,
 		Platform: c,
+		FallbackSink: func(list []string) {
+			if err := st.SetFallbacks(c.SetFallbacks(list)); err != nil {
+				logger.Printf("could not save the platform's fallback addresses: %v", err)
+			}
+		},
+		Route: c.Route,
 		Runner: runner.Runner{
 			Version:     version,
 			Survey:      func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
@@ -250,6 +258,7 @@ func selftest(args []string) error {
 		return err
 	}
 	c.Credential = st.Credential
+	c.SetFallbacks(st.Fallbacks)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := c.CheckIn(ctx); err != nil {
