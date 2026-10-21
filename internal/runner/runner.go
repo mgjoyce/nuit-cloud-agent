@@ -126,6 +126,10 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		}
 		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
 	}
+	if name == "nuit-cloud-wired" {
+		// the platform must still be reachable with the wireless interfaces down before the saved network is removed
+		env = append(env, "NCS_PLATFORM_URL="+r.PlatformURL)
+	}
 	if raw, ok := task.Params["ssh"].(map[string]any); ok {
 		fingerprints, err := sshFingerprints(raw)
 		if err != nil {

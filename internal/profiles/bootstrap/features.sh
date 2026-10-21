@@ -766,3 +766,78 @@ ROLLBACK
   ss -ltnH 2>/dev/null | awk '{print $4}' | grep -q ":$port\$" || { sh "$d/rollback.sh"; echo "  sshd is not listening on port $port after the reload, so the change was taken away" >&2; return 1; }
   echo "  SSH now refuses passwords and root login (sshd uses PermitRootLogin $root, PasswordAuthentication $pass). Waiting for the platform to test sshd from outside and confirm within ${SSH_CONFIRM_SECONDS}s; otherwise passwords come back."
 }
+
+# ─── Taking a machine off Wi-Fi, with the platform in the check ──────────────────────────────────────────────────────────────────
+# A Nuit Cloud Server is wired. This turns a machine's wireless interfaces off and removes what remembers the network (the stanzas
+# in /etc/network/interfaces*, and wpa_supplicant files that hold a passphrase), but only when a wired interface carries the
+# default route AND the platform can still be reached with the wireless interfaces down. Order matters: the interfaces go down
+# first and come straight back if the platform cannot be reached, and the configuration is removed only after that proof, because
+# removing a passphrase cannot be undone.
+wifi_ifaces() {
+  for d in "$(p /sys/class/net)"/*; do
+    [ -e "$d" ] || continue
+    if [ -e "$d/wireless" ] || [ -e "$d/phy80211" ]; then basename "$d"; fi
+  done
+}
+wifi_files() { # the ifupdown files and wpa_supplicant files that mention wireless
+  for f in "$(p /etc/network/interfaces)" "$(p /etc/network/interfaces.d)"/* "$(p /etc/wpa_supplicant)"/*.conf; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+f_ncs_wifi_off_ok() {
+  ifs="$(wifi_ifaces)"
+  for i in $ifs; do
+    [ "$(cat "$(p /sys/class/net)/$i/operstate" 2>/dev/null)" = up ] && return 1
+    for f in $(wifi_files); do
+      case "$f" in
+        */wpa_supplicant/*) grep -Eq '^[[:space:]]*(psk|password)=' "$f" && return 1 ;;
+        *) grep -Eq "^[[:space:]]*(auto|allow-hotplug|iface)[[:space:]]+$i([[:space:]]|\$)|^[[:space:]]*wpa-(ssid|psk|conf)" "$f" && return 1 ;;
+      esac
+    done
+  done
+  return 0
+}
+wifi_proof() {
+  if [ -n "${NCS_PLATFORM_URL:-}" ]; then
+    for _ in 1 2 3 4 5 6; do
+      curl -fsS --max-time 15 -o /dev/null "$NCS_PLATFORM_URL/api/agent/download/VERSION" 2>/dev/null && return 0
+      sleep 5
+    done
+    return 1
+  fi
+  return 1
+}
+wifi_default_dev() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+f_ncs_wifi_off_do() {
+  ifs="$(wifi_ifaces)"
+  [ -n "$ifs" ] || { echo "  no wireless interface here"; return 0; }
+  dev="$(wifi_default_dev)"
+  case " $(echo $ifs) " in *" $dev "*) echo "  the default route is on the wireless interface $dev: connect a cable first, then run this again" >&2; return 3 ;; esac
+  [ -n "$dev" ] || { echo "  there is no default route: nothing is carrying the machine's traffic" >&2; return 3; }
+  f_ncs_wired_ok || { echo "  no wired connection is up: connect a cable, then run this again" >&2; return 3; }
+  [ -n "${NCS_PLATFORM_URL:-}" ] || { echo "  the platform's address was not passed in, so the change cannot be proved safe" >&2; return 3; }
+  # 1. wireless interfaces down (reversible)
+  for i in $ifs; do ip link set "$i" down; done
+  # 2. proof: the platform must still be reachable by the wired path
+  if ! wifi_proof; then
+    for i in $ifs; do ip link set "$i" up; done
+    echo "  the platform could not be reached with wireless off, so the wireless interfaces were switched back on" >&2
+    return 1
+  fi
+  # 3. only now remove what remembers the network (not undoable)
+  for i in $ifs; do
+    for f in $(wifi_files); do
+      case "$f" in
+        */wpa_supplicant/*) grep -Eq '^[[:space:]]*(psk|password)=' "$f" && rm -f "$f" ;;
+        *)
+          awk -v ifc="$i" '
+            function starts(l) { return l ~ /^[[:space:]]*(auto|allow-[a-z]+|iface|source|source-directory|mapping)[[:space:]]/ }
+            { if (starts($0)) skip = ($0 ~ "^[[:space:]]*(auto|allow-[a-z]+|iface)[[:space:]]+" ifc "([[:space:]]|$)")
+              if (skip) next
+              print }' "$f" >"$f.nuit-cloud.new" && cat "$f.nuit-cloud.new" >"$f"; rm -f "$f.nuit-cloud.new" ;;
+      esac
+    done
+  done
+  command -v rfkill >/dev/null 2>&1 && rfkill block wifi 2>/dev/null || true
+  echo "  wireless interfaces ($(echo $ifs)) are off, nothing remembers the network, and the platform answers over $dev"
+}
