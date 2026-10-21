@@ -841,3 +841,29 @@ f_ncs_wifi_off_do() {
   command -v rfkill >/dev/null 2>&1 && rfkill block wifi 2>/dev/null || true
   echo "  wireless interfaces ($(echo $ifs)) are off, nothing remembers the network, and the platform answers over $dev"
 }
+
+# ─── The platform's SSH login ──────────────────────────────────────────────────────────────────────────────────────────────────────
+# Installs the platform's own public key (NCS_PLATFORM_SSH_KEY, from the signed task) for the login the platform uses, $NC_USER.
+# It adds the one key line if it is missing and nothing else: other keys stay, the account is never created (MANUAL if it is
+# missing), and the directory and file get the owner and modes sshd insists on. Public key only; nothing secret passes through.
+login_home() { getent passwd "$NC_USER" 2>/dev/null | cut -d: -f6; }
+login_key_ok() { # the key's body (type and base64) is already authorised
+  home="$(login_home)"; [ -n "$home" ] || return 1
+  body="$(printf '%s' "$NCS_PLATFORM_SSH_KEY" | awk '{print $1" "$2}')"
+  [ -f "$home/.ssh/authorized_keys" ] && awk -v b="$body" '{ if (($1" "$2)==b) f=1 } END { exit f?0:1 }' "$home/.ssh/authorized_keys"
+}
+f_ncs_login_ok() { [ -n "${NCS_PLATFORM_SSH_KEY:-}" ] && f_user_ok && login_key_ok; }
+f_ncs_login_do() {
+  case "${NCS_PLATFORM_SSH_KEY:-}" in ssh-ed25519\ *) ;; *) echo "  the task carries no ssh-ed25519 public key" >&2; return 3 ;; esac
+  case "$NCS_PLATFORM_SSH_KEY" in *'
+'*) echo "  the key must be a single line" >&2; return 3 ;; esac
+  f_user_ok || { echo "  the account $NC_USER does not exist: create it first (adduser $NC_USER), then run this again" >&2; return 3; }
+  home="$(login_home)"; ssh_dir="$home/.ssh"; file="$ssh_dir/authorized_keys"
+  grp="$(id -gn "$NC_USER" 2>/dev/null || echo "$NC_USER")"
+  mkdir -p "$ssh_dir"; chmod 700 "$ssh_dir"
+  [ -f "$file" ] || : >"$file"
+  login_key_ok || { [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l | tr -d " ")" = 0 ] && echo >>"$file"; printf '%s\n' "$NCS_PLATFORM_SSH_KEY" >>"$file"; }
+  chmod 600 "$file"
+  chown "$NC_USER:$grp" "$ssh_dir" "$file" 2>/dev/null || [ -n "${ROOT:-}" ]
+  echo "  the platform's key is authorised for $NC_USER (other keys left as they were)"
+}

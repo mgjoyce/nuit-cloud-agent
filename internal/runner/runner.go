@@ -130,6 +130,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		// the platform must still be reachable with the wireless interfaces down before the saved network is removed
 		env = append(env, "NCS_PLATFORM_URL="+r.PlatformURL)
 	}
+	if raw, ok := task.Params["login"].(map[string]any); ok {
+		key, _ := raw["publicKey"].(string)
+		if !loginKey.MatchString(key) {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable ssh-ed25519 public key"}
+		}
+		env = append(env, "NCS_PLATFORM_SSH_KEY="+key)
+	}
 	if raw, ok := task.Params["ssh"].(map[string]any); ok {
 		fingerprints, err := sshFingerprints(raw)
 		if err != nil {
@@ -352,6 +359,9 @@ func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 var sshFingerprint = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
 
 // sshFingerprints reads the keys the platform says must still be able to log in, refusing anything that is not a fingerprint.
+// loginKey is one ssh-ed25519 public key line with an optional comment: nothing that could carry options or a second line.
+var loginKey = regexp.MustCompile(`^ssh-ed25519 [A-Za-z0-9+/]{68}( [A-Za-z0-9@._-]{1,64})?$`)
+
 func sshFingerprints(raw map[string]any) ([]string, error) {
 	list, _ := raw["requireFingerprints"].([]any)
 	if len(list) < 1 || len(list) > 10 {
