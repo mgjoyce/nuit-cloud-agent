@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
@@ -48,6 +50,8 @@ type Runner struct {
 	Updater SelfUpdater
 	// SSHConfirm completes the SSH hardening: re-checks what sshd uses and cancels the rollback timer; injectable for tests.
 	SSHConfirm func(ctx context.Context) (sshconfirm.Result, error)
+	// FirewallConfirm completes the baseline firewall: checks the table is loaded and cancels the rollback timer; injectable for tests.
+	FirewallConfirm func(ctx context.Context) (fwconfirm.Result, error)
 	// Scan asks which addresses of a private range answer on the machine's network; injectable for tests.
 	Scan func(ctx context.Context, first, last string) (lanscan.Result, error)
 	// Smoke runs the runtime's smoke test in a namespace and returns what it printed and its exit status; injectable for tests.
@@ -62,7 +66,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -97,6 +101,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.scan(ctx, task)
 	case "ssh-confirm":
 		return r.sshConfirm(ctx)
+	case "firewall-confirm":
+		return r.firewallConfirm(ctx)
 	}
 	return client.Report{Status: "failed", ExitCode: &one, Output: "unknown task " + task.Name}
 }
@@ -125,6 +131,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 			return client.Report{Status: "failed", ExitCode: &one, Output: "the task carries no usable management address"}
 		}
 		env = append(env, "NCS_MANAGEMENT_ADDRESS="+addr, "NCS_PLATFORM_URL="+r.PlatformURL)
+	}
+	if raw, ok := task.Params["firewall"].(map[string]any); ok {
+		fwEnv, err := firewallEnvironment(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		env = append(env, fwEnv...)
 	}
 	if name == "nuit-cloud-wired" {
 		// the platform must still be reachable with the wireless interfaces down before the saved network is removed
@@ -359,6 +372,48 @@ func vlanEnvironment(raw map[string]any, platformURL string) ([]string, error) {
 var sshFingerprint = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
 
 // sshFingerprints reads the keys the platform says must still be able to log in, refusing anything that is not a fingerprint.
+// firewallEnvironment turns the signed firewall parameters into the scripts' settings: the TCP ports to open to anyone and the ranges
+// SSH may come from. Both are validated again here; the platform's own check is not the only one.
+var firewallCIDR = regexp.MustCompile(`^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$`)
+
+func firewallEnvironment(raw map[string]any) ([]string, error) {
+	var ports, from []string
+	if list, ok := raw["tcp"].([]any); ok {
+		if len(list) > 16 {
+			return nil, errors.New("the firewall task opens at most 16 TCP ports")
+		}
+		for _, v := range list {
+			n, ok := v.(float64)
+			if !ok || n != float64(int(n)) || n < 1 || n > 65535 {
+				return nil, fmt.Errorf("%v is not a TCP port", v)
+			}
+			ports = append(ports, strconv.Itoa(int(n)))
+		}
+	}
+	if list, ok := raw["sshFrom"].([]any); ok {
+		if len(list) > 8 {
+			return nil, errors.New("the firewall task names at most 8 ranges")
+		}
+		for _, v := range list {
+			c, _ := v.(string)
+			m := firewallCIDR.FindStringSubmatch(c)
+			if m == nil {
+				return nil, fmt.Errorf("%q is not a range such as 10.0.0.0/8", c)
+			}
+			for _, o := range m[1:5] {
+				if n, _ := strconv.Atoi(o); n > 255 {
+					return nil, fmt.Errorf("%q is not a range such as 10.0.0.0/8", c)
+				}
+			}
+			if n, _ := strconv.Atoi(m[5]); n > 32 {
+				return nil, fmt.Errorf("%q is not a range such as 10.0.0.0/8", c)
+			}
+			from = append(from, c)
+		}
+	}
+	return []string{"NCS_FIREWALL_TCP=" + strings.Join(ports, ","), "NCS_FIREWALL_SSH_FROM=" + strings.Join(from, ",")}, nil
+}
+
 // loginKey is one ssh-ed25519 public key line with an optional comment: nothing that could carry options or a second line.
 var loginKey = regexp.MustCompile(`^ssh-ed25519 [A-Za-z0-9+/]{68}( [A-Za-z0-9@._-]{1,64})?$`)
 
@@ -376,6 +431,23 @@ func sshFingerprints(raw map[string]any) ([]string, error) {
 		out = append(out, f)
 	}
 	return out, nil
+}
+
+// firewallConfirm completes the baseline firewall once the platform has tested from outside.
+func (r Runner) firewallConfirm(ctx context.Context) client.Report {
+	one, zero := 1, 0
+	run := r.FirewallConfirm
+	if run == nil {
+		run = fwconfirm.Confirmer{Run: func(ctx context.Context, name string, args ...string) (string, error) {
+			out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+			return string(out), err
+		}}.Confirm
+	}
+	res, err := run(ctx)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error(), Result: res}
+	}
+	return client.Report{Status: "done", ExitCode: &zero, Output: res.Note, Result: res}
 }
 
 // sshConfirm completes the SSH hardening once the platform has tested sshd from outside.

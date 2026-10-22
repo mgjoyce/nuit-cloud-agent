@@ -878,3 +878,131 @@ f_ncs_login_do() {
   fi
   echo "  the platform's key is authorised for $NC_USER (other keys left as they were)"
 }
+
+# ─── A baseline firewall that leaves the platform's ports open and nothing else ───────────────────────────────────────────────────
+# One nftables table (`inet nuit_cloud`) with an INPUT chain that drops by default and accepts: loopback, the container bridges (pods keep
+# the host as their gateway and resolver, as before), replies to what the machine started, ICMP, DHCP, SSH from the platform's own
+# ranges (NCS_FIREWALL_SSH_FROM, default the private ranges) and the TCP ports the task names (NCS_FIREWALL_TCP, e.g. 80 443 on a machine
+# that serves routes; open to anyone). Forwarded traffic is not touched: a pod's published ports are DNATed and forwarded, so the
+# tenants' services are unaffected and nothing here isolates tenants from each other (that is its own design, issue #91).
+# Like the SSH change, this can lock everyone out, so: the rules are syntax-checked first; a timer (nuit-cloud-firewall-rollback) that
+# deletes the table is armed before anything is loaded; after loading, sshd must still be listening; and the timer is left ARMED
+# until the platform has tested from outside (SSH reachable, the open ports not blocked, a port nobody opened dropped) and sent
+# `firewall-confirm`. If that test fails or never happens, the firewall removes itself. The rules are reloaded at boot by a unit.
+FW_TABLE="${FW_TABLE:-nuit_cloud}"
+FW_RULES="${FW_RULES:-/etc/nuit-cloud/firewall.nft}"
+FW_UNIT="${FW_UNIT:-/etc/systemd/system/nuit-cloud-firewall.service}"
+FW_CONFIRM_SECONDS="${NCS_FIREWALL_CONFIRM_SECONDS:-600}"
+FW_DEFAULT_SSH_FROM="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+fw_words() { printf '%s' "$1" | tr ',' ' '; }
+fw_ports() { fw_words "${NCS_FIREWALL_TCP:-}" | tr -s ' ' '\n' | grep -v '^$' | sort -n -u | tr '\n' ' '; }
+fw_ssh_from() { v="$(fw_words "${NCS_FIREWALL_SSH_FROM:-}")"; [ -n "$v" ] || v="$FW_DEFAULT_SSH_FROM"; printf '%s' "$v" | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '; }
+fw_inputs_ok() {
+  for pt in $(fw_ports); do printf '%s' "$pt" | grep -Eq '^[0-9]{1,5}$' && [ "$pt" -ge 1 ] && [ "$pt" -le 65535 ] || return 1; done
+  for c in $(fw_ssh_from); do printf '%s' "$c" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' || return 1; done
+}
+fw_render() { # the ruleset on stdout
+  v4="$(fw_ssh_from | tr -s ' ' ',' | sed 's/,$//')"
+  echo "# Written by the nuit-cloud agent (profile nuit-cloud-firewall). Edit the task, not this file."
+  echo "table inet $FW_TABLE"
+  echo "delete table inet $FW_TABLE"
+  echo "table inet $FW_TABLE {"
+  echo "  chain input {"
+  echo "    type filter hook input priority 0; policy drop;"
+  echo "    iif lo accept"
+  echo "    iifname { \"ocisaas0\", \"cni0\", \"docker0\", \"br-*\" } accept"
+  echo "    ct state established,related accept"
+  echo "    ct state invalid drop"
+  echo "    ip protocol icmp accept"
+  echo "    ip6 nexthdr icmpv6 accept"
+  echo "    udp dport 68 accept"
+  echo "    tcp dport 22 ip saddr { $v4 } accept"
+  echo "    tcp dport 22 ip6 saddr { fc00::/7, fe80::/10 } accept"
+  ports="$(fw_ports | sed 's/ *$//' | tr -s ' ' ',')"
+  [ -z "$ports" ] || echo "    tcp dport { $ports } accept"
+  echo "  }"
+  echo "}"
+}
+fw_loaded() { nft list table inet "$FW_TABLE" >/dev/null 2>&1; }
+f_ncs_firewall_ok() {
+  [ -f "$(p "$FW_RULES")" ] && fw_inputs_ok && [ "$(fw_render)" = "$(cat "$(p "$FW_RULES")")" ] && fw_loaded && systemctl is-enabled --quiet nuit-cloud-firewall 2>/dev/null
+}
+f_ncs_firewall_do() {
+  fw_inputs_ok || { echo "  the task's ports or ranges are not valid (ports 1-65535, ranges like 10.0.0.0/8)" >&2; return 3; }
+  command -v systemd-run >/dev/null 2>&1 || { echo "  systemd-run is needed for the safety timer" >&2; return 3; }
+  if ! command -v nft >/dev/null 2>&1; then apt-get install -y -qq nftables >/dev/null 2>&1 || true; fi
+  command -v nft >/dev/null 2>&1 || { echo "  nftables is not installed and could not be installed" >&2; return 3; }
+  port="$(sshd_effective port)"; port="${port:-22}"
+  [ "$port" = 22 ] || { echo "  sshd listens on port $port, not 22: the baseline only opens 22, so set it up by hand" >&2; return 3; }
+  d="$(p "$ADDR_DIR")/firewall"; rm -rf "$d"; mkdir -p "$d"; chmod 700 "$d"
+  rules="$(p "$FW_RULES")"; mkdir -p "$(dirname "$rules")"
+  [ -f "$rules" ] && cp -p "$rules" "$d/previous-rules"
+  fw_render >"$d/new.nft"
+  nft -c -f "$d/new.nft" 2>"$d/check.out" || { echo "  nft rejected the rules ($(tr '\n' ' ' <"$d/check.out" | cut -c1-160)): nothing was changed" >&2; return 1; }
+  cat >"$d/rollback.sh" <<ROLLBACK
+#!/bin/sh
+# Take the firewall away again. Run by the safety timer, or at once if the change could not be proved to work.
+PATH="\$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+echo "nuit-cloud: removing the firewall"
+nft delete table inet $FW_TABLE 2>/dev/null
+systemctl disable nuit-cloud-firewall 2>/dev/null
+if [ -f "$d/previous-rules" ]; then cp -p "$d/previous-rules" "$rules"; else rm -f "$rules"; fi
+rm -f "$d/armed"
+exit 0
+ROLLBACK
+  chmod 700 "$d/rollback.sh"
+  systemd-run --quiet --unit=nuit-cloud-firewall-rollback --collect --on-active="${FW_CONFIRM_SECONDS}s" /bin/sh "$d/rollback.sh" || { echo "  could not arm the safety timer; nothing was changed" >&2; return 1; }
+  : >"$d/armed"
+  cp "$d/new.nft" "$rules"; chmod 644 "$rules"
+  unit="$(p "$FW_UNIT")"; mkdir -p "$(dirname "$unit")"
+  cat >"$unit" <<UNIT
+[Unit]
+Description=Nuit Cloud baseline firewall
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f $FW_RULES
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload 2>/dev/null || true
+  if ! nft -f "$rules"; then sh "$d/rollback.sh"; echo "  nft could not load the rules, so they were taken away" >&2; return 1; fi
+  fw_loaded || { sh "$d/rollback.sh"; echo "  the table is not there after loading, so the change was taken away" >&2; return 1; }
+  ss -ltnH 2>/dev/null | awk '{print $4}' | grep -q ":22\$" || { sh "$d/rollback.sh"; echo "  sshd is not listening on port 22, so the firewall was taken away" >&2; return 1; }
+  systemctl enable nuit-cloud-firewall >/dev/null 2>&1 || true
+  echo "  the firewall is loaded: SSH from $(fw_ssh_from)${NCS_FIREWALL_TCP:+, TCP $(fw_ports)}, nothing else inbound. Waiting for the platform to test from outside and confirm within ${FW_CONFIRM_SECONDS}s; otherwise it is removed."
+}
+
+# ─── Weekly housekeeping ────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A systemd timer (a minimal Debian has no cron) that once a week empties the apt package cache, drops packages nothing needs and trims
+# the journal to JOURNAL_MAX. It removes nothing a running service uses; container images belong to the container runtime's own cleanup.
+f_ncs_housekeeping_ok() { [ -e "$(p /etc/systemd/system/nuit-cloud-housekeeping.timer)" ] && [ -e "$(p /etc/systemd/system/nuit-cloud-housekeeping.service)" ]; }
+f_ncs_housekeeping_do() {
+  write_if_missing /etc/systemd/system/nuit-cloud-housekeeping.service <<UNIT
+[Unit]
+Description=Nuit Cloud weekly housekeeping
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'apt-get clean; apt-get -y -qq autoremove --purge; journalctl --vacuum-size=${JOURNAL_MAX}'
+UNIT
+  write_if_missing /etc/systemd/system/nuit-cloud-housekeeping.timer <<'UNIT'
+[Unit]
+Description=Weekly Nuit Cloud housekeeping
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now nuit-cloud-housekeeping.timer
+}

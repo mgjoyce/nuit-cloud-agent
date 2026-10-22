@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
@@ -436,6 +437,37 @@ func TestSSHConfirmReportsWhatTheConfirmerSaid(t *testing.T) {
 		return sshconfirm.Result{Armed: true}, errors.New("sshd does not use the hardened settings")
 	}
 	if rep := r.Run(context.Background(), &taskverify.Task{Name: "ssh-confirm", TimeoutSeconds: 30}); rep.Status != "failed" {
+		t.Errorf("%+v", rep)
+	}
+}
+
+func TestFirewallParametersBecomeTheScriptsSettingsAndAreCheckedAgain(t *testing.T) {
+	env, err := firewallEnvironment(map[string]any{"tcp": []any{float64(80), float64(443)}, "sshFrom": []any{"10.10.10.0/24"}})
+	if err != nil || strings.Join(env, "|") != "NCS_FIREWALL_TCP=80,443|NCS_FIREWALL_SSH_FROM=10.10.10.0/24" {
+		t.Fatalf("%v %v", env, err)
+	}
+	for _, bad := range []map[string]any{
+		{"tcp": []any{float64(0)}}, {"tcp": []any{float64(70000)}}, {"tcp": []any{"80"}}, {"tcp": []any{80.5}},
+		{"sshFrom": []any{"10.0.0.0"}}, {"sshFrom": []any{"300.0.0.0/8"}}, {"sshFrom": []any{"10.0.0.0/33"}}, {"sshFrom": []any{"$(id)/8"}},
+	} {
+		if _, err := firewallEnvironment(bad); err == nil {
+			t.Errorf("%v was accepted", bad)
+		}
+	}
+}
+
+func TestFirewallConfirmReportsWhatTheConfirmerSaid(t *testing.T) {
+	r := Runner{}
+	r.FirewallConfirm = func(context.Context) (fwconfirm.Result, error) {
+		return fwconfirm.Result{Armed: true, Confirmed: true, Note: "ok"}, nil
+	}
+	if rep := r.firewallConfirm(context.Background()); rep.Status != "done" {
+		t.Errorf("%+v", rep)
+	}
+	r.FirewallConfirm = func(context.Context) (fwconfirm.Result, error) {
+		return fwconfirm.Result{Armed: true}, errors.New("the table is not loaded")
+	}
+	if rep := r.firewallConfirm(context.Background()); rep.Status != "failed" {
 		t.Errorf("%+v", rep)
 	}
 }
