@@ -615,6 +615,8 @@ f_ncs_vlan_do() {
   for m in NetworkManager systemd-networkd; do
     ! systemctl is-active --quiet "$m" 2>/dev/null || { echo "  $m manages the network here; this feature only handles ifupdown" >&2; return 3; }
   done
+  # A minimal Debian has nftables and no iptables, and this runs before the runtime (which installs it) on a new machine.
+  command -v iptables >/dev/null 2>&1 || apt-get install -y -qq iptables >/dev/null 2>&1 || true
   command -v systemd-run >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 || { echo "  systemd-run (the safety timer) and iptables (reply routing) are needed" >&2; return 3; }
   addr_discover && [ -n "$A_GW" ] || { echo "  could not find the default route and its interface" >&2; return 3; }
   printf '%s\n' "$A_IF" | grep -Eq '^[a-zA-Z0-9_-]{1,10}$' || { echo "  the interface name $A_IF cannot carry a VLAN sub-interface here" >&2; return 3; }
