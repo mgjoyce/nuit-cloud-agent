@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -46,6 +47,8 @@ var (
 
 // Params are what a signed profile-apply carries for the runtime.
 type Params struct {
+	// Arch is the architecture the pins are for (amd64 or arm64). Empty means a platform that predates architectures: the unsuffixed files, amd64.
+	Arch              string
 	BundleVersion     string
 	BundleSHA256      string
 	ContainerdVersion string
@@ -59,10 +62,13 @@ type Params struct {
 func ParseParams(raw map[string]any) (Params, error) {
 	str := func(k string) string { s, _ := raw[k].(string); return s }
 	p := Params{
-		BundleVersion: str("bundleVersion"), BundleSHA256: str("bundleSha256"),
+		Arch: str("arch"), BundleVersion: str("bundleVersion"), BundleSHA256: str("bundleSha256"),
 		ContainerdVersion: str("containerdVersion"), ContainerdSHA256: str("containerdSha256"),
 		CrictlVersion: str("crictlVersion"), CrictlSHA256: str("crictlSha256"),
 		RootFingerprint: str("rootFingerprint"),
+	}
+	if p.Arch != "" && p.Arch != "amd64" && p.Arch != "arm64" {
+		return Params{}, fmt.Errorf("the runtime parameters name an architecture this agent does not know (%q)", p.Arch)
 	}
 	for _, v := range []string{p.BundleVersion, p.ContainerdVersion, p.CrictlVersion} {
 		if !version.MatchString(v) {
@@ -88,6 +94,10 @@ type Stager struct {
 // Stage downloads and checks both files and returns the environment the profile scripts read, plus a function that removes
 // the files. Nothing is returned for the scripts to use unless both checksums matched.
 func (s Stager) Stage(ctx context.Context, p Params) (env []string, cleanup func(), err error) {
+	// The files are built for one architecture: never stage another's on this machine, whatever the checksums say.
+	if p.Arch != "" && p.Arch != hostArch() {
+		return nil, nil, fmt.Errorf("these runtime files are for %s and this machine is %s", p.Arch, hostArch())
+	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return nil, nil, err
 	}
@@ -96,17 +106,17 @@ func (s Stager) Stage(ctx context.Context, p Params) (env []string, cleanup func
 		return nil, nil, err
 	}
 	cleanup = func() { os.RemoveAll(dir) }
-	bundle, err := s.fetch(ctx, BundleFile, filepath.Join(dir, BundleFile), p.BundleSHA256, maxBundleBytes)
+	bundle, err := s.fetch(ctx, named(BundleFile, p.Arch), filepath.Join(dir, BundleFile), p.BundleSHA256, maxBundleBytes)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	containerd, err := s.fetch(ctx, ContainerdFile, filepath.Join(dir, ContainerdFile), p.ContainerdSHA256, maxContainerdBytes)
+	containerd, err := s.fetch(ctx, named(ContainerdFile, p.Arch), filepath.Join(dir, ContainerdFile), p.ContainerdSHA256, maxContainerdBytes)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	crictl, err := s.fetch(ctx, CrictlFile, filepath.Join(dir, CrictlFile), p.CrictlSHA256, maxCrictlBytes)
+	crictl, err := s.fetch(ctx, named(CrictlFile, p.Arch), filepath.Join(dir, CrictlFile), p.CrictlSHA256, maxCrictlBytes)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
@@ -118,6 +128,18 @@ func (s Stager) Stage(ctx context.Context, p Params) (env []string, cleanup func
 		"NCS_RUNTIME_ROOT_FINGERPRINT=" + p.RootFingerprint,
 		"NCS_CONTAINERD_TARBALL=" + containerd,
 	}, cleanup, nil
+}
+
+// hostArch is this machine's architecture as the platform names it. A variable so tests can stand in for another machine.
+var hostArch = func() string { return runtime.GOARCH }
+
+// named is the name the platform serves a file under for an architecture: `containerd.tar.gz` becomes `containerd-arm64.tar.gz`. With no
+// architecture it is the old, unsuffixed name.
+func named(file, arch string) string {
+	if arch == "" {
+		return file
+	}
+	return strings.TrimSuffix(file, ".tar.gz") + "-" + arch + ".tar.gz"
 }
 
 func (s Stager) fetch(ctx context.Context, name, dst, want string, limit int64) (string, error) {

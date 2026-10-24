@@ -95,3 +95,53 @@ func TestParseParamsIsStrict(t *testing.T) {
 		}
 	}
 }
+
+func TestStageFetchesTheFilesNamedForThePinnedArchitecture(t *testing.T) {
+	srv := server(t, map[string]string{"oci-saas-bundle-arm64.tar.gz": "bundle bytes", "containerd-arm64.tar.gz": "containerd bytes", "crictl-arm64.tar.gz": "crictl bytes"})
+	defer srv.Close()
+	old := hostArch
+	hostArch = func() string { return "arm64" }
+	defer func() { hostArch = old }()
+	p := params("bundle bytes", "containerd bytes")
+	p.Arch = "arm64"
+	_, cleanup, err := Stager{BaseURL: srv.URL, Dir: t.TempDir()}.Stage(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+}
+
+func TestStageRefusesFilesBuiltForAnotherArchitecture(t *testing.T) {
+	srv := server(t, map[string]string{"oci-saas-bundle-arm64.tar.gz": "bundle bytes", "containerd-arm64.tar.gz": "containerd bytes", "crictl-arm64.tar.gz": "crictl bytes"})
+	defer srv.Close()
+	old := hostArch
+	hostArch = func() string { return "amd64" }
+	defer func() { hostArch = old }()
+	dir := t.TempDir()
+	p := params("bundle bytes", "containerd bytes")
+	p.Arch = "arm64"
+	if _, _, err := (Stager{BaseURL: srv.URL, Dir: dir}).Stage(context.Background(), p); err == nil || !strings.Contains(err.Error(), "for arm64 and this machine is amd64") {
+		t.Fatalf("want a refusal naming both architectures, got %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("a refused stage left %d entries behind", len(entries))
+	}
+}
+
+func TestParseParamsKnowsArchitecturesAndStaysCompatible(t *testing.T) {
+	raw := map[string]any{"bundleVersion": "v4", "bundleSha256": sum("a"), "containerdVersion": "2.2.10", "containerdSha256": sum("b"), "crictlVersion": "1.37.0", "crictlSha256": sum("c"), "rootFingerprint": strings.Repeat("a", 64)}
+	if p, err := ParseParams(raw); err != nil || p.Arch != "" {
+		t.Fatalf("the platform that predates architectures must still parse: %v %q", err, p.Arch)
+	}
+	raw["arch"] = "arm64"
+	if p, err := ParseParams(raw); err != nil || p.Arch != "arm64" {
+		t.Fatalf("arm64 must parse: %v %q", err, p.Arch)
+	}
+	raw["arch"] = "riscv64"
+	if _, err := ParseParams(raw); err == nil {
+		t.Fatal("an architecture the agent does not know must be refused")
+	}
+	if named(ContainerdFile, "") != "containerd.tar.gz" || named(ContainerdFile, "arm64") != "containerd-arm64.tar.gz" {
+		t.Error("file naming")
+	}
+}
