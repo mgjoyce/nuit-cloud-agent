@@ -207,6 +207,8 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 # Run by hand without them, the feature says what is missing. The first install gives the node the bundle's initial policy, which
 # admits namespace nuit-cloud-platform only; the platform's hourly policy-sync replaces it once the node is a registered pool host.
 OCISAAS_ETC="${OCISAAS_ETC:-/etc/oci-saas}"
+# Where the pinned containerd 2.x goes when the machine has an older one it must not replace.
+OCISAAS_CONTAINERD_DIR="${OCISAAS_CONTAINERD_DIR:-/usr/local/lib/oci-saas/bin}"
 # The bundle's smoke test (a pod in a microVM answers HTTP) is kept here so the agent's runtime-smoke task can run it later: root-owned, copied from the verified bundle.
 OCISAAS_SMOKE="${OCISAAS_SMOKE:-/usr/local/lib/nuit-cloud/oci-saas-smoke.sh}"
 # What "installed" means, in two parts the platform tells apart: the runtime is *running* here (its binary, its service, its socket, its keys),
@@ -270,11 +272,13 @@ f_oci_saas_runtime_do() {
   sv="$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')"
   [ "${sv:-0}" -ge 254 ] 2>/dev/null || { echo "  the runtime needs systemd 254 or newer (this is ${sv:-unknown})" >&2; return 3; }
 
-  # A containerd already at /usr/bin that is not 2.x belongs to something else (Docker's package); it is not replaced.
+  # The runtime needs containerd 2.x. With none on the machine the pinned release goes to /usr/bin; with 2.x there it is used. An older one
+  # there (Docker's, which other services depend on) is left alone: the pinned 2.x goes in a directory of its own and the runtime's unit is
+  # pointed at it by a systemd drop-in (which survives the bundle rewriting the unit). The bundle's installer only needs a containerd 2.x first
+  # on PATH and an executable /usr/bin/containerd, so nobody has to decide anything and Docker keeps the containerd it has.
   have="$("$(p /usr/bin/containerd)" --version 2>/dev/null || true)"
-  if [ -n "$have" ] && ! printf '%s' "$have" | grep -qE ' v?2\.'; then
-    echo "  /usr/bin/containerd is $have; the runtime needs 2.x and will not replace another service's containerd: a person decides" >&2; return 3
-  fi
+  dedicated=
+  if [ -n "$have" ] && ! printf '%s' "$have" | grep -qE ' v?2\.'; then dedicated=1; fi
 
   apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd python3-minimal || return 1
 
@@ -291,7 +295,16 @@ f_oci_saas_runtime_do() {
     rm -rf "$work"; echo "  the bundle's keys chain to root $got, not the root the platform pinned: nothing was installed" >&2; return 1
   fi
 
-  if [ -z "$have" ]; then
+  bundle_path="$PATH"
+  if [ -n "$dedicated" ]; then
+    ded="$(p "$OCISAAS_CONTAINERD_DIR")"
+    mkdir -p "$ded" "$(p /etc/systemd/system/containerd-ocisaas.service.d)"
+    tar -xzf "$NCS_CONTAINERD_TARBALL" -C "$work" bin/containerd || { rm -rf "$work"; echo "  could not unpack containerd" >&2; return 1; }
+    install -m 0755 "$work/bin/containerd" "$ded/containerd"
+    printf '[Service]\nExecStart=\nExecStart=%s/containerd --config %s/containerd.toml\n' "$OCISAAS_CONTAINERD_DIR" "$OCISAAS_ETC" >"$(p /etc/systemd/system/containerd-ocisaas.service.d/10-dedicated-containerd.conf)"
+    echo "  /usr/bin/containerd is $have, which other services use: it is left alone, and the runtime runs the pinned containerd 2.x from $OCISAAS_CONTAINERD_DIR" >&2
+    bundle_path="$ded:$PATH"
+  elif [ -z "$have" ]; then
     tar -xzf "$NCS_CONTAINERD_TARBALL" -C "$work" bin/containerd || { rm -rf "$work"; echo "  could not unpack containerd" >&2; return 1; }
     install -m 0755 "$work/bin/containerd" "$(p /usr/bin/containerd)"
   fi
@@ -315,7 +328,7 @@ f_oci_saas_runtime_do() {
     fi
   fi
   # shellcheck disable=SC2086
-  "$dir/packaging/dedicated/install.sh" --bin "$dir/bin" --guest "$dir/guest" --artifacts-pub "$dir/artifacts.pub" \
+  PATH="$bundle_path" "$dir/packaging/dedicated/install.sh" --bin "$dir/bin" --guest "$dir/guest" --artifacts-pub "$dir/artifacts.pub" \
     --policy-pub "$dir/policy.pub" $mode --cni-bin /usr/lib/cni --add-user "$NC_USER" \
     || { rm -rf "$work"; echo "  the bundle's install.sh failed (its output is above)" >&2; return 1; }
   [ -z "$restart_after" ] || systemctl restart containerd-ocisaas   # running pods keep running
