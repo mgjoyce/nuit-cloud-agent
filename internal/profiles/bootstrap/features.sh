@@ -249,9 +249,16 @@ f_oci_saas_runtime_ok() {
   return 1
 }
 
-# The fingerprint of the root key in a keys file (`root <hex>`): the SHA-256 of the key's bytes.
+# The fingerprint of the root key in a keys file (`root <hex>`): the SHA-256 of the key's bytes. Nothing at all (and no output) when it cannot be
+# worked out: a missing tool must never look like a different key, so the empty input's hash is refused too. perl is part of Debian's base system
+# (xxd is not: it comes with vim-common, and a machine installed by hand may lack it); xxd is the fallback.
 root_fingerprint_of() { # root_fingerprint_of <artifacts.pub>
-  awk '$1=="root" {print $2; exit}' "$1" | xxd -r -p | sha256sum | awk '{print $1}'
+  hex="$(awk '$1=="root" {print $2; exit}' "$1")"
+  [ -n "$hex" ] || return 1
+  if command -v perl >/dev/null 2>&1; then got="$(printf '%s' "$hex" | perl -ne 'print pack("H*", $_)' | sha256sum | awk '{print $1}')"
+  elif command -v xxd >/dev/null 2>&1; then got="$(printf '%s' "$hex" | xxd -r -p | sha256sum | awk '{print $1}')"
+  else return 1; fi
+  [ -n "$got" ] && [ "$got" != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ] && printf '%s\n' "$got"
 }
 
 f_oci_saas_runtime_do() {
@@ -276,7 +283,10 @@ f_oci_saas_runtime_do() {
   dir="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -1)"
   [ -n "$dir" ] && [ -x "$dir/packaging/dedicated/install.sh" ] && [ -f "$dir/artifacts.pub" ] && [ -f "$dir/policy.pub" ] \
     || { rm -rf "$work"; echo "  the bundle does not have the layout of an oci-saas bundle" >&2; return 1; }
-  got="$(root_fingerprint_of "$dir/artifacts.pub")"
+  got="$(root_fingerprint_of "$dir/artifacts.pub")" || got=
+  if [ -z "$got" ]; then
+    rm -rf "$work"; echo "  cannot work out the bundle's root key fingerprint here (it needs perl or xxd, and a root key in artifacts.pub): nothing was installed" >&2; return 1
+  fi
   if [ "$got" != "$NCS_RUNTIME_ROOT_FINGERPRINT" ]; then
     rm -rf "$work"; echo "  the bundle's keys chain to root $got, not the root the platform pinned: nothing was installed" >&2; return 1
   fi
@@ -336,7 +346,10 @@ f_oci_saas_record_do() {
   dir="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -1)"
   [ -n "$dir" ] && [ -x "$dir/packaging/dedicated/smoke.sh" ] && [ -f "$dir/artifacts.pub" ] && [ -f "$dir/policy.pub" ] \
     || { rm -rf "$work"; echo "  the bundle does not have the layout of an oci-saas bundle" >&2; return 1; }
-  got="$(root_fingerprint_of "$dir/artifacts.pub")"
+  got="$(root_fingerprint_of "$dir/artifacts.pub")" || got=
+  if [ -z "$got" ]; then
+    rm -rf "$work"; echo "  cannot work out the bundle's root key fingerprint here (it needs perl or xxd, and a root key in artifacts.pub): nothing was recorded" >&2; return 1
+  fi
   if [ "$got" != "$NCS_RUNTIME_ROOT_FINGERPRINT" ]; then
     rm -rf "$work"; echo "  the bundle's keys chain to root $got, not the root the platform pinned: nothing was recorded" >&2; return 1
   fi
