@@ -27,4 +27,4 @@ sync-bootstrap:
 	rm -rf internal/profiles/bootstrap
 	mkdir -p internal/profiles/bootstrap/profiles
 	cp $(BOOTSTRAP_SRC)/bootstrap.sh $(BOOTSTRAP_SRC)/features.sh internal/profiles/bootstrap/
-	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-address.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-vlan.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-ssh.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-wired.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-login.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-firewall.sh internal/profiles/bootstrap/profiles/
+	cp $(BOOTSTRAP_SRC)/profiles/nuit-cloud-server.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-address.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-vlan.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-ssh.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-wired.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-login.sh $(BOOTSTRAP_SRC)/profiles/nuit-cloud-firewall.sh $(BOOTSTRAP_SRC)/profiles/nuit-container-service-record.sh internal/profiles/bootstrap/profiles/

@@ -209,12 +209,44 @@ f_cgroup2_do() { echo "  boot with the unified cgroup hierarchy (systemd.unified
 OCISAAS_ETC="${OCISAAS_ETC:-/etc/oci-saas}"
 # The bundle's smoke test (a pod in a microVM answers HTTP) is kept here so the agent's runtime-smoke task can run it later: root-owned, copied from the verified bundle.
 OCISAAS_SMOKE="${OCISAAS_SMOKE:-/usr/local/lib/nuit-cloud/oci-saas-smoke.sh}"
-f_oci_saas_runtime_ok() {
+# What "installed" means, in two parts the platform tells apart: the runtime is *running* here (its binary, its service, its socket, its keys),
+# and the platform has a *record* of it (the smoke script it keeps, and the SHA-256 of the bundle it came from). A runtime installed by hand
+# before the profile existed is running with no record; the first note below says exactly that, and the nuit-container-service-record profile
+# writes the record, after comparing what is installed with the pinned bundle, without restarting anything.
+# The platform looks for this phrase in the notes of a drifting oci_saas_runtime (nuit-cloud-servers/src/commissioning.ts).
+OCISAAS_UNRECORDED_NOTE='installed and running, but not recorded'
+ocisaas_running() {
   [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] && systemctl is-active --quiet containerd-ocisaas \
     && [ -e "$(p /run/oci-saas/containerd.sock)" ] \
-    && [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ] && [ -x "$(p "$OCISAAS_SMOKE")" ] || return 1
-  # when the platform names a bundle, the one installed must be it (an upgrade then shows as drift)
+    && [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ]
+}
+ocisaas_recorded() {
+  [ -x "$(p "$OCISAAS_SMOKE")" ] || return 1
+  # when the platform names a bundle, the one recorded must be it (an upgrade then shows as drift)
   [ -z "${NCS_RUNTIME_BUNDLE_SHA256:-}" ] || [ "$(cat "$(p "$OCISAAS_ETC/installed-bundle")" 2>/dev/null)" = "$NCS_RUNTIME_BUNDLE_SHA256" ]
+}
+f_oci_saas_runtime_ok() {
+  if ocisaas_running; then
+    ocisaas_recorded && return 0
+    missing=
+    [ -x "$(p "$OCISAAS_SMOKE")" ] || missing="the smoke-test script ($OCISAAS_SMOKE)"
+    if [ ! -e "$(p "$OCISAAS_ETC/installed-bundle")" ]; then
+      missing="${missing:+$missing, }the record of which bundle it came from ($OCISAAS_ETC/installed-bundle)"
+      echo "  $OCISAAS_UNRECORDED_NOTE: missing $missing. Nothing needs installing: the nuit-container-service-record profile compares what is here with the pinned bundle and writes the record without restarting anything" >&2
+    elif [ -n "$missing" ]; then
+      echo "  $OCISAAS_UNRECORDED_NOTE: missing $missing. The nuit-container-service-record profile puts it back without restarting anything" >&2
+    else
+      echo "  a different bundle is recorded here than the one the platform pins: applying this profile upgrades the runtime (and restarts it)" >&2
+    fi
+    return 1
+  fi
+  miss=
+  [ -x "$(p /usr/local/bin/crictl-ocisaas)" ] || miss="$miss crictl-ocisaas"
+  systemctl is-active --quiet containerd-ocisaas || miss="$miss containerd-ocisaas(service not active)"
+  [ -e "$(p /run/oci-saas/containerd.sock)" ] || miss="$miss the-runtime-socket"
+  { [ -s "$(p "$OCISAAS_ETC/artifacts.pub")" ] && [ -s "$(p "$OCISAAS_ETC/policy.pub")" ]; } || miss="$miss the-key-files"
+  echo "  not installed, or not running here; missing:$miss" >&2
+  return 1
 }
 
 # The fingerprint of the root key in a keys file (`root <hex>`): the SHA-256 of the key's bytes.
@@ -280,6 +312,41 @@ f_oci_saas_runtime_do() {
   mkdir -p "$(p "$OCISAAS_ETC")" "$(dirname "$(p "$OCISAAS_SMOKE")")"
   install -m 0755 "$dir/packaging/dedicated/smoke.sh" "$(p "$OCISAAS_SMOKE")"
   printf '%s\n' "${NCS_RUNTIME_BUNDLE_SHA256:-unknown}" >"$(p "$OCISAAS_ETC/installed-bundle")"
+  rm -rf "$work"
+}
+
+# What is installed, compared with the pinned bundle: the first file that differs, or nothing when the install is that bundle. Only what the
+# bundle's own install.sh puts down from the bundle itself is compared (the programs, the guest artifacts and the two key files), never the
+# policy, which the platform publishes after the install.
+ocisaas_mismatch() { # ocisaas_mismatch <unpacked bundle dir>
+  for f in "$1"/bin/*; do cmp -s "$f" "$(p "/usr/local/bin/$(basename "$f")")" || { basename "$f"; return; }; done
+  for f in "$1"/guest/*; do cmp -s "$f" "$(p "$OCISAAS_ETC/artifacts/$(basename "$f")")" || { echo "artifacts/$(basename "$f")"; return; }; done
+  cmp -s "$1/artifacts.pub" "$(p "$OCISAAS_ETC/artifacts.pub")" || { echo artifacts.pub; return; }
+  cmp -s "$1/policy.pub" "$(p "$OCISAAS_ETC/policy.pub")" || echo policy.pub
+}
+f_oci_saas_record_ok() { ocisaas_running && ocisaas_recorded; }
+f_oci_saas_record_do() {
+  if [ -z "${NCS_RUNTIME_BUNDLE:-}" ] || [ -z "${NCS_RUNTIME_ROOT_FINGERPRINT:-}" ] || [ -z "${NCS_RUNTIME_BUNDLE_SHA256:-}" ]; then
+    echo "  recording needs the pinned bundle: ask for this profile from the platform, which gives the agent the bundle and the root fingerprint to check it against" >&2; return 3
+  fi
+  ocisaas_running || { echo "  the runtime is not installed or not running here: there is nothing to record. Install it with the nuit-container-service profile" >&2; return 3; }
+  [ -f "$NCS_RUNTIME_BUNDLE" ] || { echo "  the bundle is not where the agent said it put it" >&2; return 1; }
+  work="$(mktemp -d)"
+  tar -xzf "$NCS_RUNTIME_BUNDLE" -C "$work" || { rm -rf "$work"; echo "  the bundle is not a readable tarball" >&2; return 1; }
+  dir="$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -1)"
+  [ -n "$dir" ] && [ -x "$dir/packaging/dedicated/smoke.sh" ] && [ -f "$dir/artifacts.pub" ] && [ -f "$dir/policy.pub" ] \
+    || { rm -rf "$work"; echo "  the bundle does not have the layout of an oci-saas bundle" >&2; return 1; }
+  got="$(root_fingerprint_of "$dir/artifacts.pub")"
+  if [ "$got" != "$NCS_RUNTIME_ROOT_FINGERPRINT" ]; then
+    rm -rf "$work"; echo "  the bundle's keys chain to root $got, not the root the platform pinned: nothing was recorded" >&2; return 1
+  fi
+  diff="$(ocisaas_mismatch "$dir")"
+  if [ -n "$diff" ]; then
+    rm -rf "$work"; echo "  what is installed here is not the pinned bundle ($diff differs): nothing was recorded. Applying the nuit-container-service profile installs the pinned bundle, which restarts the runtime" >&2; return 3
+  fi
+  mkdir -p "$(p "$OCISAAS_ETC")" "$(dirname "$(p "$OCISAAS_SMOKE")")"
+  install -m 0755 "$dir/packaging/dedicated/smoke.sh" "$(p "$OCISAAS_SMOKE")"
+  printf '%s\n' "$NCS_RUNTIME_BUNDLE_SHA256" >"$(p "$OCISAAS_ETC/installed-bundle")"
   rm -rf "$work"
 }
 
