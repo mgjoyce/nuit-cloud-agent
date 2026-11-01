@@ -421,6 +421,30 @@ f_ncs_volumes_do() {
   mount "$VOLUMES_DIR"
 }
 
+# ─── Where tenants' container logs are written ─────────────────────────────────────────────────────────────────────────────────
+# containerd (root) creates each log file 0640 with the group of the directory it lands in, and the platform reads logs as its login
+# (`crictl logs` opens the file as that user). Without a shared root that is group-owned by the runtime's group and setgid, the logs land under the
+# login's home where root's files are unreadable to it, and the portal's Logs view fails with "permission denied". The connector uses this
+# directory when it exists and is writable by the login (container-management's DEFAULT_LOG_ROOT). A pod made before the directory existed keeps its
+# old log place: it logs here once it is deployed again.
+OCISAAS_LOG_ROOT="${OCISAAS_LOG_ROOT:-/var/lib/oci-saas/logs}"
+OCISAAS_GROUP="${OCISAAS_GROUP:-oci-saas}"
+f_ncs_log_root_ok() {
+  d="$(p "$OCISAAS_LOG_ROOT")"
+  [ -d "$d" ] && [ -g "$d" ] || return 1
+  [ -n "$ROOT" ] || [ "$(ls -ld "$d" | awk '{print $4}')" = "$OCISAAS_GROUP" ]   # (the group is not checked under a test ROOT: it cannot be changed there)
+}
+f_ncs_log_root_do() {
+  # the runtime's install makes the group and this directory's parent: before it there is nothing to give the logs to
+  if [ ! -d "$(p "$OCISAAS_ETC")" ] || { [ -z "$ROOT" ] && ! getent group "$OCISAAS_GROUP" >/dev/null 2>&1; }; then
+    echo "  the runtime is not installed yet (it makes the group $OCISAAS_GROUP): this runs after it" >&2; return 3
+  fi
+  d="$(p "$OCISAAS_LOG_ROOT")"
+  mkdir -p "$d"
+  chgrp "$OCISAAS_GROUP" "$d"
+  chmod 2775 "$d"
+}
+
 # ─── The management address the platform allocated (ticket #67) ──────────────────────────────────────────────────────────────
 # Turns the machine's DHCP address into the static one the platform allocated for it. This can cut a machine off from the platform,
 # so it is built to be undone without anyone's help:
