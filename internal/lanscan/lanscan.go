@@ -24,6 +24,10 @@ const MaxAddresses = 256
 type Answer struct {
 	Address string `json:"address"`
 	MAC     string `json:"mac,omitempty"`
+	// Self is true for an address of the machine that ran the scan. It cannot probe itself (nothing answers an ARP request from the
+	// machine's own address), but it is certainly there, and it knows its own MAC: without this the platform showed the scanning
+	// machine as not answering, with no MAC.
+	Self bool `json:"self,omitempty"`
 }
 
 type Result struct {
@@ -41,8 +45,8 @@ type Scanner struct {
 	Has func(name string) bool
 	// Interface is the interface of the default route.
 	Interface func() (string, error)
-	// Own are this machine's own IPv4 addresses (not probed).
-	Own func() map[string]bool
+	// Own are this machine's own IPv4 addresses, each with the hardware address of the interface that holds it (not probed, but reported).
+	Own func() map[string]string
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -65,12 +69,15 @@ func Real() Scanner {
 			}
 			return DefaultInterface(string(raw))
 		},
-		Own: func() map[string]bool {
-			own := map[string]bool{}
-			addrs, _ := net.InterfaceAddrs()
-			for _, a := range addrs {
-				if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-					own[ipn.IP.String()] = true
+		Own: func() map[string]string {
+			own := map[string]string{}
+			ifaces, _ := net.Interfaces()
+			for _, ifc := range ifaces {
+				addrs, _ := ifc.Addrs()
+				for _, a := range addrs {
+					if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+						own[ipn.IP.String()] = strings.ToLower(ifc.HardwareAddr.String())
+					}
 				}
 			}
 			return own
@@ -146,7 +153,9 @@ func (s Scanner) Scan(ctx context.Context, first, last string) (Result, error) {
 	sem := make(chan struct{}, 16)
 	scanned := 0
 	for _, addr := range addrs {
-		if own[addr] {
+		if mac, mine := own[addr]; mine {
+			// not probed (the machine cannot ask itself), but reported: it answers, and its MAC is known
+			answered = append(answered, Answer{Address: addr, MAC: mac, Self: true})
 			continue
 		}
 		scanned++

@@ -39,7 +39,7 @@ func fake(answering map[string]string, installed ...string) (Scanner, *[]string)
 		},
 		Has:       func(n string) bool { return has[n] },
 		Interface: func() (string, error) { return "eth0", nil },
-		Own:       func() map[string]bool { return map[string]bool{"10.10.10.163": true} },
+		Own:       func() map[string]string { return map[string]string{"10.10.10.163": "aa:bb:cc:00:00:03"} },
 	}, &calls
 }
 
@@ -49,8 +49,12 @@ func TestArpingFindsWhatAnswersAndTheirMACs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Method != "arping" || r.From != "eth0" || r.Scanned != 4 || len(r.Answered) != 2 || r.Answered[0] != (Answer{"10.10.10.162", "aa:bb:cc:00:00:02"}) || r.Answered[1].Address != "10.10.10.164" {
+	if r.Method != "arping" || r.From != "eth0" || r.Scanned != 4 || len(r.Answered) != 3 || r.Answered[0] != (Answer{Address: "10.10.10.162", MAC: "aa:bb:cc:00:00:02"}) || r.Answered[2].Address != "10.10.10.164" {
 		t.Errorf("%+v", r)
+	}
+	// the machine's own address answers too, with its own MAC, flagged as its own, in order among the others
+	if r.Answered[1] != (Answer{Address: "10.10.10.163", MAC: "aa:bb:cc:00:00:03", Self: true}) {
+		t.Errorf("own address not reported as itself: %+v", r.Answered[1])
 	}
 	for _, c := range *calls {
 		if strings.Contains(c, "10.10.10.163") {
@@ -97,5 +101,25 @@ func TestTheDefaultInterfaceIsTheRouteTo0000(t *testing.T) {
 	}
 	if _, err := DefaultInterface("Iface\tDestination\n"); err == nil {
 		t.Error("no default route was accepted")
+	}
+}
+
+func TestItsOwnAddressesAreReportedWithTheirMACButNeverProbed(t *testing.T) {
+	s, calls := fake(nil, "arping")
+	s.Own = func() map[string]string {
+		return map[string]string{"10.10.10.163": "aa:bb:cc:00:00:03", "10.10.10.200": "aa:bb:cc:00:00:99", "192.168.1.5": "aa:bb:cc:00:00:05"}
+	}
+	r, err := s.Scan(context.Background(), "10.10.10.160", "10.10.10.165")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// only the own address inside the scanned range is reported, and the scan covered the other five addresses
+	if len(r.Answered) != 1 || r.Answered[0] != (Answer{Address: "10.10.10.163", MAC: "aa:bb:cc:00:00:03", Self: true}) || r.Scanned != 5 {
+		t.Errorf("%+v", r)
+	}
+	for _, c := range *calls {
+		if strings.Contains(c, "10.10.10.163") {
+			t.Errorf("probed its own address: %s", c)
+		}
 	}
 }
