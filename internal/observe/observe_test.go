@@ -44,7 +44,7 @@ func fake(out string, err error) Collector {
 }
 
 func TestTheNetworkObservationHasTheInterfacesAndTheNeighbours(t *testing.T) {
-	data, err := fake(neigh, nil).Collect(context.Background(), Network)
+	data, _, err := fake(neigh, nil).Collect(context.Background(), Network)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestTheNetworkObservationHasTheInterfacesAndTheNeighbours(t *testing.T) {
 }
 
 func TestAMachineWithoutIPStillReportsItsInterfaces(t *testing.T) {
-	data, _ := fake("", errors.New("not found")).Collect(context.Background(), Network)
+	data, _, _ := fake("", errors.New("not found")).Collect(context.Background(), Network)
 	f := data.(NetworkFacts)
 	if len(f.Interfaces) != 2 || f.Neighbours == nil || len(f.Neighbours) != 0 {
 		t.Errorf("%+v", f)
@@ -70,7 +70,7 @@ func TestOnlyTheNetworkKindIsKnown(t *testing.T) {
 	if !c.Known("network") || c.Known("cpu") || c.Known("") {
 		t.Error("the catalog is closed")
 	}
-	if data, _ := c.Collect(context.Background(), "cpu"); data != nil {
+	if data, v, _ := c.Collect(context.Background(), "cpu"); data != nil || v != "" {
 		t.Error("an unknown kind collects nothing")
 	}
 }
@@ -91,5 +91,21 @@ func TestTheReportIsBounded(t *testing.T) {
 	}
 	if n := len(ParseNeighbours(b.String())); n > maxNeighbours {
 		t.Errorf("%d neighbours", n)
+	}
+}
+
+func TestTheVersionChangesWithTheFactNotWithTheNoise(t *testing.T) {
+	_, v1, _ := fake(neigh, nil).Collect(context.Background(), Network)
+	// the same neighbours in another order and in another state are the same fact
+	shuffled := "10.10.10.1 dev br0 lladdr 74:ac:b9:11:22:33 STALE\n10.10.10.162 dev br0 lladdr 8e:ff:e6:55:1b:1e DELAY\n"
+	_, v2, _ := fake(shuffled, nil).Collect(context.Background(), Network)
+	if v1 != v2 || len(v1) != 16 {
+		t.Errorf("%q vs %q", v1, v2)
+	}
+	// a new neighbour, or a changed MAC, is a different one
+	_, v3, _ := fake(shuffled+"10.10.10.9 dev br0 lladdr aa:aa:aa:aa:aa:01 REACHABLE\n", nil).Collect(context.Background(), Network)
+	_, v4, _ := fake(strings.Replace(shuffled, "74:ac:b9:11:22:33", "74:ac:b9:11:22:34", 1), nil).Collect(context.Background(), Network)
+	if v3 == v2 || v4 == v2 || v3 == v4 {
+		t.Errorf("%q %q %q", v2, v3, v4)
 	}
 }

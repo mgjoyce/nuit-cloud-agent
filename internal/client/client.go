@@ -39,9 +39,9 @@ type Client struct {
 
 	mu        sync.Mutex
 	fallbacks []string
-	// wanted is what the platform last asked to be sent with the check-in; sentAt is when each kind last went.
+	// wanted is what the platform last asked to be sent with the check-in; sent is what the agent last sent of each kind, and when it last read it.
 	wanted []Want
-	sentAt map[string]time.Time
+	sent   map[string]sentRecord
 	// preferred is the route that worked last: 0 is the name, n is fallbacks[n-1].
 	preferred int
 }
@@ -201,20 +201,31 @@ func (c *Client) Enroll(ctx context.Context, code, hostname string) (*EnrollResp
 // Observer reads one kind of observation.
 type Observer interface {
 	Known(kind string) bool
-	Collect(ctx context.Context, kind string) (any, error)
+	// Collect reads a kind: the data to send and its version (a digest of the fact, equal when the fact has not changed).
+	Collect(ctx context.Context, kind string) (data any, version string, err error)
 }
 
 // Want is a kind of observation the platform asks for, and how often.
 type Want struct {
 	Kind            string `json:"kind"`
 	IntervalSeconds int    `json:"intervalSeconds"`
+	// Have is the version the platform already holds for this machine. A kind is sent only when this agent's version differs from it.
+	Have string `json:"have,omitempty"`
 }
 
 // Observation is one fact sent with a check-in.
 type Observation struct {
 	Kind       string `json:"kind"`
 	ObservedAt string `json:"observedAt"`
+	Version    string `json:"version"`
 	Data       any    `json:"data"`
+}
+
+// sentRecord is what the agent last sent of a kind, and when it last read it.
+type sentRecord struct {
+	version string
+	sentAt  time.Time
+	readAt  time.Time
 }
 
 type checkInBody struct {
@@ -234,9 +245,11 @@ func (c *Client) now() time.Time {
 	return time.Now()
 }
 
-// due reads what the platform asked for and is due: a kind it asked for, that this agent knows, not sent within its interval. A read that
-// fails is skipped; it is tried again at the next check-in.
-func (c *Client) due(ctx context.Context) ([]Observation, []string) {
+// due reads what the platform asked for and sends only what has changed. A kind is read at most once per interval, and sent only when this
+// agent's version of it differs from the one the platform says it holds (`Have`), so an unchanged fact costs no traffic at all. The agent remembers
+// when it last read and sent each kind, so a kind the platform keeps not holding (it refused it, or lost it) is tried again once per interval,
+// not at every check-in. A read that fails is skipped and tried at the next one.
+func (c *Client) due(ctx context.Context) ([]Observation, []sentUpdate) {
 	if c.Observer == nil {
 		return nil, nil
 	}
@@ -244,40 +257,52 @@ func (c *Client) due(ctx context.Context) ([]Observation, []string) {
 	wanted := append([]Want(nil), c.wanted...)
 	c.mu.Unlock()
 	var list []Observation
-	var kinds []string
+	var updates []sentUpdate
 	now := c.now()
 	for _, w := range wanted {
 		if !c.Observer.Known(w.Kind) {
 			continue
 		}
 		c.mu.Lock()
-		last, ok := c.sentAt[w.Kind]
+		rec, had := c.sent[w.Kind]
 		c.mu.Unlock()
-		if ok && now.Sub(last) < time.Duration(w.IntervalSeconds)*time.Second {
+		interval := time.Duration(w.IntervalSeconds) * time.Second
+		if had && now.Sub(rec.readAt) < interval {
 			continue
 		}
-		data, err := c.Observer.Collect(ctx, w.Kind)
-		if err != nil || data == nil {
+		data, version, err := c.Observer.Collect(ctx, w.Kind)
+		if err != nil || data == nil || version == "" {
 			continue
 		}
-		list = append(list, Observation{Kind: w.Kind, ObservedAt: now.UTC().Format(time.RFC3339), Data: data})
-		kinds = append(kinds, w.Kind)
+		rec.readAt = now
+		if version == w.Have {
+			// the platform already holds exactly this: nothing to send
+			updates = append(updates, sentUpdate{kind: w.Kind, rec: sentRecord{version: version, sentAt: rec.sentAt, readAt: now}})
+			continue
+		}
+		list = append(list, Observation{Kind: w.Kind, ObservedAt: now.UTC().Format(time.RFC3339), Version: version, Data: data})
+		updates = append(updates, sentUpdate{kind: w.Kind, rec: sentRecord{version: version, sentAt: now, readAt: now}})
 	}
-	return list, kinds
+	return list, updates
+}
+
+type sentUpdate struct {
+	kind string
+	rec  sentRecord
 }
 
 // CheckIn is the routine call. It carries the observations the platform asked for that are due.
 func (c *Client) CheckIn(ctx context.Context) (*CheckInResponse, error) {
-	list, kinds := c.due(ctx)
+	list, updates := c.due(ctx)
 	var out CheckInResponse
 	err := c.do(ctx, "/api/agent/checkin", checkInBody{Observations: list}, true, &out)
 	if err == nil {
 		c.mu.Lock()
-		if c.sentAt == nil {
-			c.sentAt = map[string]time.Time{}
+		if c.sent == nil {
+			c.sent = map[string]sentRecord{}
 		}
-		for _, k := range kinds {
-			c.sentAt[k] = c.now()
+		for _, u := range updates {
+			c.sent[u.kind] = u.rec
 		}
 		if out.Observe != nil {
 			c.wanted = c.wanted[:0]
@@ -292,7 +317,7 @@ func (c *Client) CheckIn(ctx context.Context) (*CheckInResponse, error) {
 				if d > maxObserveInterval {
 					d = maxObserveInterval
 				}
-				c.wanted = append(c.wanted, Want{Kind: w.Kind, IntervalSeconds: int(d / time.Second)})
+				c.wanted = append(c.wanted, Want{Kind: w.Kind, IntervalSeconds: int(d / time.Second), Have: w.Have})
 			}
 		}
 		c.mu.Unlock()

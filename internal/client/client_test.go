@@ -118,61 +118,150 @@ func TestRotateReturnsTheNewCredential(t *testing.T) {
 
 type fakeObserver struct {
 	collected []string
+	version   string
 	fail      bool
 }
 
 func (f *fakeObserver) Known(kind string) bool { return kind == "network" }
-func (f *fakeObserver) Collect(_ context.Context, kind string) (any, error) {
+func (f *fakeObserver) Collect(_ context.Context, kind string) (any, string, error) {
 	f.collected = append(f.collected, kind)
 	if f.fail {
-		return nil, io.ErrUnexpectedEOF
+		return nil, "", io.ErrUnexpectedEOF
 	}
-	return map[string]any{"interfaces": []any{}, "neighbours": []any{}}, nil
+	return map[string]any{"interfaces": []any{}, "neighbours": []any{}}, f.version, nil
 }
 
-func TestObservationsAreSentOnlyWhenAskedForKnownAndDue(t *testing.T) {
-	var asked string
+// obsPlatform is a stand-in that holds the version it was last sent, and says so in its answers, as the real one does.
+type obsPlatform struct {
+	t      *testing.T
+	have   string
+	bodies []map[string]any
+	extra  string
+}
+
+func (p *obsPlatform) handler(w http.ResponseWriter, r *http.Request) {
+	var b map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	p.bodies = append(p.bodies, b)
+	if list, ok := b["observations"].([]any); ok {
+		for _, o := range list {
+			p.have, _ = o.(map[string]any)["version"].(string)
+		}
+	}
+	have := ""
+	if p.have != "" {
+		have = `,"have":"` + p.have + `"`
+	}
+	_, _ = io.WriteString(w, `{"pollIntervalSeconds":30,"observe":[{"kind":"network","intervalSeconds":300`+have+`},{"kind":"cpu","intervalSeconds":60}]}`)
+}
+
+func (p *obsPlatform) sentOn(i int) bool { return p.bodies[i]["observations"] != nil }
+
+func TestAnUnchangedFactIsSentOnceAndThenNothingAtAllUntilItChanges(t *testing.T) {
+	p := &obsPlatform{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(p.handler))
+	defer srv.Close()
+	c, _ := New(srv.URL, "1", true)
+	obs := &fakeObserver{version: "v1"}
+	c.Observer = obs
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	c.Now = func() time.Time { return now }
+	ctx := context.Background()
+	call := func(advance time.Duration) {
+		now = now.Add(advance)
+		if _, err := c.CheckIn(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	call(0) // nothing is asked for yet: nothing is read or sent
+	if p.sentOn(0) || len(obs.collected) != 0 {
+		t.Fatalf("sent before being asked: %v / %v", p.bodies[0], obs.collected)
+	}
+	call(30 * time.Second) // asked for, obsPlatform holds none: sent, with its version, and only the kind this agent knows
+	sent, _ := p.bodies[1]["observations"].([]any)
+	if len(sent) != 1 || sent[0].(map[string]any)["version"] != "v1" || sent[0].(map[string]any)["kind"] != "network" {
+		t.Fatalf("%v", p.bodies[1])
+	}
+	for i := 0; i < 6; i++ { // every interval it is read again, and found unchanged: no traffic of this kind
+		call(5 * time.Minute)
+		if p.sentOn(len(p.bodies) - 1) {
+			t.Fatalf("an unchanged fact was sent again: %v", p.bodies[len(p.bodies)-1])
+		}
+	}
+	if len(obs.collected) != 7 {
+		t.Errorf("read %d times", len(obs.collected))
+	}
+	obs.version = "v2" // it changes: sent once more
+	call(5 * time.Minute)
+	if !p.sentOn(len(p.bodies) - 1) {
+		t.Error("a changed fact must be sent")
+	}
+	call(5 * time.Minute)
+	if p.sentOn(len(p.bodies) - 1) {
+		t.Error("and then not again")
+	}
+}
+
+func TestBetweenIntervalsNothingIsReadAtAll(t *testing.T) {
+	p := &obsPlatform{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(p.handler))
+	defer srv.Close()
+	c, _ := New(srv.URL, "1", true)
+	obs := &fakeObserver{version: "v1"}
+	c.Observer = obs
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	c.Now = func() time.Time { return now }
+	for i := 0; i < 11; i++ { // ten check-ins in five minutes
+		_, _ = c.CheckIn(context.Background())
+		now = now.Add(30 * time.Second)
+	}
+	if len(obs.collected) != 1 {
+		t.Errorf("read %d times in one interval", len(obs.collected))
+	}
+}
+
+func TestWhenThePlatformDoesNotHoldWhatWasSentItIsTriedAgainOncePerIntervalNotEveryCheckIn(t *testing.T) {
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var b map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&b)
 		bodies = append(bodies, b)
-		_, _ = io.WriteString(w, asked)
+		_, _ = io.WriteString(w, `{"observe":[{"kind":"network","intervalSeconds":300,"have":"other"}]}`) // always holds something else
 	}))
 	defer srv.Close()
 	c, _ := New(srv.URL, "1", true)
-	obs := &fakeObserver{}
-	c.Observer = obs
+	c.Observer = &fakeObserver{version: "v1"}
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	c.Now = func() time.Time { return now }
-	ctx := context.Background()
+	sends := 0
+	for i := 0; i < 21; i++ { // ten minutes of 30-second check-ins
+		_, _ = c.CheckIn(context.Background())
+		now = now.Add(30 * time.Second)
+	}
+	for _, b := range bodies {
+		if b["observations"] != nil {
+			sends++
+		}
+	}
+	if sends != 2 {
+		t.Errorf("sent %d times in ten minutes", sends)
+	}
+}
 
-	// Nothing is asked for yet, so nothing is read or sent.
-	asked = `{"pollIntervalSeconds":30,"tasks":[],"observe":[{"kind":"network","intervalSeconds":300},{"kind":"cpu","intervalSeconds":60}]}`
-	if _, err := c.CheckIn(ctx); err != nil {
-		t.Fatal(err)
+func TestAFailedReadIsSkippedAndTheCheckInStillHappens(t *testing.T) {
+	p := &obsPlatform{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(p.handler))
+	defer srv.Close()
+	c, _ := New(srv.URL, "1", true)
+	c.Observer = &fakeObserver{fail: true}
+	for i := 0; i < 3; i++ {
+		if _, err := c.CheckIn(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if len(obs.collected) != 0 || bodies[0]["observations"] != nil {
-		t.Fatalf("collected %v, sent %v", obs.collected, bodies[0])
-	}
-	// Now it is asked for: the known kind goes, the unknown one does not.
-	if _, err := c.CheckIn(ctx); err != nil {
-		t.Fatal(err)
-	}
-	sent, _ := bodies[1]["observations"].([]any)
-	if len(sent) != 1 || sent[0].(map[string]any)["kind"] != "network" || sent[0].(map[string]any)["observedAt"] != "2026-11-03T12:00:00Z" {
-		t.Fatalf("sent %v", bodies[1])
-	}
-	// Not again inside its interval, and again after it.
-	now = now.Add(2 * time.Minute)
-	_, _ = c.CheckIn(ctx)
-	if bodies[2]["observations"] != nil || len(obs.collected) != 1 {
-		t.Errorf("sent again too soon: %v, read %v", bodies[2], obs.collected)
-	}
-	now = now.Add(4 * time.Minute)
-	_, _ = c.CheckIn(ctx)
-	if bodies[3]["observations"] == nil {
-		t.Error("due again after the interval")
+	if p.sentOn(2) {
+		t.Errorf("sent %v", p.bodies[2])
 	}
 }
 
@@ -189,10 +278,12 @@ func TestAnAnswerWithoutObserveChangesNothingAndAnEmptyListAsksForNone(t *testin
 	}))
 	defer srv.Close()
 	c, _ := New(srv.URL, "1", true)
-	c.Observer = &fakeObserver{}
+	obs := &fakeObserver{}
+	c.Observer = obs
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	c.Now = func() time.Time { now = now.Add(10 * time.Minute); return now }
 	for i := 0; i < 4; i++ {
+		obs.version = string(rune('a' + i)) // changes every time, so only the request decides
 		if _, err := c.CheckIn(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -205,24 +296,5 @@ func TestAnAnswerWithoutObserveChangesNothingAndAnEmptyListAsksForNone(t *testin
 	}
 	if bodies[3]["observations"] != nil { // the empty list withdrew it
 		t.Error("an empty list asks for none")
-	}
-}
-
-func TestAFailedReadIsSkippedAndTheCheckInStillHappens(t *testing.T) {
-	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
-		_, _ = io.WriteString(w, `{"observe":[{"kind":"network","intervalSeconds":60}]}`)
-	}))
-	defer srv.Close()
-	c, _ := New(srv.URL, "1", true)
-	c.Observer = &fakeObserver{fail: true}
-	for i := 0; i < 2; i++ {
-		if _, err := c.CheckIn(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got["observations"] != nil {
-		t.Errorf("sent %v", got)
 	}
 }

@@ -7,6 +7,8 @@ package observe
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"os/exec"
 	"regexp"
@@ -89,12 +91,34 @@ func realInterfaces() []Interface {
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
 func (c Collector) Known(kind string) bool { return kind == Network }
 
-// Collect reads one kind. The result is what is sent as the observation's `data`.
-func (c Collector) Collect(ctx context.Context, kind string) (any, error) {
+// Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
+// not changed has the same version and the agent can leave it unsent; it leaves out what changes without the fact changing (a neighbour's state flips between
+// REACHABLE and STALE all the time).
+func (c Collector) Collect(ctx context.Context, kind string) (any, string, error) {
 	if kind != Network {
-		return nil, nil
+		return nil, "", nil
 	}
-	return c.network(ctx), nil
+	facts := c.network(ctx)
+	return facts, facts.Version(), nil
+}
+
+// Version is a short digest of the interfaces and the neighbours (address, hardware address, interface), in a fixed order and without the neighbours' state.
+func (f NetworkFacts) Version() string {
+	var b strings.Builder
+	ifs := append([]Interface(nil), f.Interfaces...)
+	sort.SliceStable(ifs, func(i, j int) bool { return ifs[i].Name < ifs[j].Name })
+	for _, i := range ifs {
+		addrs := append([]string(nil), i.Addresses...)
+		sort.Strings(addrs)
+		b.WriteString("i|" + i.Name + "|" + i.MAC + "|" + strings.Join(addrs, ",") + "\n")
+	}
+	ns := append([]Neighbour(nil), f.Neighbours...)
+	sort.SliceStable(ns, func(i, j int) bool { return ns[i].Address < ns[j].Address })
+	for _, n := range ns {
+		b.WriteString("n|" + n.Address + "|" + n.MAC + "|" + n.Interface + "\n")
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func (c Collector) network(ctx context.Context) NetworkFacts {
