@@ -31,8 +31,17 @@ type Client struct {
 	Version    string
 	Credential string
 
+	// Observer, if set, reads the small facts the platform asks for with the check-in (see internal/observe). Nothing is read or sent unless the
+	// platform's last answer listed the kind, this agent knows it, and it is due.
+	Observer Observer
+	// Now is the clock, replaceable in tests.
+	Now func() time.Time
+
 	mu        sync.Mutex
 	fallbacks []string
+	// wanted is what the platform last asked to be sent with the check-in; sentAt is when each kind last went.
+	wanted []Want
+	sentAt map[string]time.Time
 	// preferred is the route that worked last: 0 is the name, n is fallbacks[n-1].
 	preferred int
 }
@@ -170,6 +179,8 @@ type CheckInResponse struct {
 	Tasks               []taskverify.Envelope `json:"tasks"`
 	// FallbackAddresses: see EnrollResponse. Absent means unchanged; an empty list clears them.
 	FallbackAddresses *[]string `json:"fallbackAddresses,omitempty"`
+	// Observe is what the platform wants sent with the check-in and how often. Absent means unchanged; an empty list asks for none.
+	Observe *[]Want `json:"observe,omitempty"`
 }
 
 // Report is what the agent says about a task.
@@ -187,10 +198,105 @@ func (c *Client) Enroll(ctx context.Context, code, hostname string) (*EnrollResp
 	return &out, err
 }
 
-// CheckIn is the routine call.
+// Observer reads one kind of observation.
+type Observer interface {
+	Known(kind string) bool
+	Collect(ctx context.Context, kind string) (any, error)
+}
+
+// Want is a kind of observation the platform asks for, and how often.
+type Want struct {
+	Kind            string `json:"kind"`
+	IntervalSeconds int    `json:"intervalSeconds"`
+}
+
+// Observation is one fact sent with a check-in.
+type Observation struct {
+	Kind       string `json:"kind"`
+	ObservedAt string `json:"observedAt"`
+	Data       any    `json:"data"`
+}
+
+type checkInBody struct {
+	Observations []Observation `json:"observations,omitempty"`
+}
+
+const (
+	minObserveInterval = time.Minute
+	maxObserveInterval = 24 * time.Hour
+	maxWanted          = 4
+)
+
+func (c *Client) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
+}
+
+// due reads what the platform asked for and is due: a kind it asked for, that this agent knows, not sent within its interval. A read that
+// fails is skipped; it is tried again at the next check-in.
+func (c *Client) due(ctx context.Context) ([]Observation, []string) {
+	if c.Observer == nil {
+		return nil, nil
+	}
+	c.mu.Lock()
+	wanted := append([]Want(nil), c.wanted...)
+	c.mu.Unlock()
+	var list []Observation
+	var kinds []string
+	now := c.now()
+	for _, w := range wanted {
+		if !c.Observer.Known(w.Kind) {
+			continue
+		}
+		c.mu.Lock()
+		last, ok := c.sentAt[w.Kind]
+		c.mu.Unlock()
+		if ok && now.Sub(last) < time.Duration(w.IntervalSeconds)*time.Second {
+			continue
+		}
+		data, err := c.Observer.Collect(ctx, w.Kind)
+		if err != nil || data == nil {
+			continue
+		}
+		list = append(list, Observation{Kind: w.Kind, ObservedAt: now.UTC().Format(time.RFC3339), Data: data})
+		kinds = append(kinds, w.Kind)
+	}
+	return list, kinds
+}
+
+// CheckIn is the routine call. It carries the observations the platform asked for that are due.
 func (c *Client) CheckIn(ctx context.Context) (*CheckInResponse, error) {
+	list, kinds := c.due(ctx)
 	var out CheckInResponse
-	err := c.do(ctx, "/api/agent/checkin", struct{}{}, true, &out)
+	err := c.do(ctx, "/api/agent/checkin", checkInBody{Observations: list}, true, &out)
+	if err == nil {
+		c.mu.Lock()
+		if c.sentAt == nil {
+			c.sentAt = map[string]time.Time{}
+		}
+		for _, k := range kinds {
+			c.sentAt[k] = c.now()
+		}
+		if out.Observe != nil {
+			c.wanted = c.wanted[:0]
+			for _, w := range *out.Observe {
+				if len(c.wanted) >= maxWanted {
+					break
+				}
+				d := time.Duration(w.IntervalSeconds) * time.Second
+				if d < minObserveInterval {
+					d = minObserveInterval
+				}
+				if d > maxObserveInterval {
+					d = maxObserveInterval
+				}
+				c.wanted = append(c.wanted, Want{Kind: w.Kind, IntervalSeconds: int(d / time.Second)})
+			}
+		}
+		c.mu.Unlock()
+	}
 	return &out, err
 }
 

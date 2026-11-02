@@ -21,6 +21,7 @@ import (
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/observe"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runner"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
@@ -159,6 +160,7 @@ func run(args []string) error {
 	}
 	c.Credential = st.Credential
 	c.SetFallbacks(st.Fallbacks)
+	c.Observer = observe.Real()
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
