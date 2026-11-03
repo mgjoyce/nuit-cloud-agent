@@ -519,3 +519,42 @@ func TestFallbackAddressesFromTheCheckInAreHandedOnAndAnEmptyListClears(t *testi
 	}
 	_ = p
 }
+
+func TestAMachineWhoseClockIsAheadRefusesTasksAsExpiredUntilItJudgesByThePlatformsTime(t *testing.T) {
+	l, p, r, v := setup(t)
+	l.Now = func() time.Time { return time.Date(2026, 10, 20, 14, 5, 0, 0, time.UTC) } // two hours ahead of the platform's 12:05
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	if _, err := l.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	l.Wait()
+	if len(r.ran) != 0 {
+		t.Fatal("a task that is over by this machine's own clock must be refused")
+	}
+
+	// Told the platform's time, the same task is current.
+	l2, p2, r2, v2 := setup(t)
+	l2.Now = func() time.Time { return time.Date(2026, 10, 20, 14, 5, 0, 0, time.UTC) }
+	l2.ClockOffset = func() (time.Duration, bool) { return -2 * time.Hour, true }
+	p2.offer = []taskverify.Envelope{v2.Tasks["ping"]}
+	if _, err := l2.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	l2.Wait()
+	if len(r2.ran) != 1 {
+		t.Errorf("ran %v: judged by the platform's time the task is not expired", r2.ran)
+	}
+	_ = p
+}
+
+func TestAnAbsurdOffsetIsNotTrusted(t *testing.T) {
+	l, p, r, v := setup(t)
+	l.Now = func() time.Time { return time.Date(2026, 10, 20, 14, 5, 0, 0, time.UTC) }
+	l.ClockOffset = func() (time.Duration, bool) { return -1000 * 24 * time.Hour, true }
+	p.offer = []taskverify.Envelope{v.Tasks["ping"]}
+	_, _ = l.Once(context.Background())
+	l.Wait()
+	if len(r.ran) != 0 {
+		t.Error("an offset of years is ignored, so the task stays expired")
+	}
+}

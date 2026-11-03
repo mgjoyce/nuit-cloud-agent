@@ -160,7 +160,9 @@ func run(args []string) error {
 	}
 	c.Credential = st.Credential
 	c.SetFallbacks(st.Fallbacks)
-	c.Observer = observe.Real()
+	facts := observe.Real()
+	facts.Clock = c.ClockOffset
+	c.Observer = facts
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -182,7 +184,8 @@ func run(args []string) error {
 				logger.Printf("could not save the platform's fallback addresses: %v", err)
 			}
 		},
-		Route: c.Route,
+		Route:       c.Route,
+		ClockOffset: c.ClockOffset,
 		Runner: runner.Runner{
 			Version:     version,
 			Survey:      func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },

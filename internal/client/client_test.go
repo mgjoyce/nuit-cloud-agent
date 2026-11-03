@@ -298,3 +298,22 @@ func TestAnAnswerWithoutObserveChangesNothingAndAnEmptyListAsksForNone(t *testin
 		t.Error("an empty list asks for none")
 	}
 }
+
+func TestTheClientMeasuresTheOffsetFromThePlatformsTime(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"pollIntervalSeconds":30,"serverTime":"2026-11-03T12:00:00Z"}`)
+	}))
+	defer srv.Close()
+	c, _ := New(srv.URL, "1", true)
+	if _, ok := c.ClockOffset(); ok {
+		t.Error("nothing is known before the first answer")
+	}
+	local := time.Date(2026, 11, 3, 14, 0, 0, 0, time.UTC) // this machine says two hours later
+	c.Now = func() time.Time { return local }
+	if _, err := c.CheckIn(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := c.ClockOffset(); !ok || d != -2*time.Hour {
+		t.Errorf("offset %v %v", d, ok)
+	}
+}

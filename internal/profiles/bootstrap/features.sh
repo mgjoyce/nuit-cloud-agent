@@ -43,9 +43,25 @@ f_updates_do() {
   printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' | write_if_missing /etc/apt/apt.conf.d/20auto-upgrades
 }
 
-# Certificate checks and token expiry depend on the clock.
-f_timesync_ok() { systemctl is-active --quiet systemd-timesyncd || systemctl is-active --quiet chrony || systemctl is-active --quiet ntpsec; }
-f_timesync_do() { apt-get install -y -qq systemd-timesyncd; timedatectl set-ntp true 2>/dev/null || true; }
+# Certificate checks and token expiry depend on the clock. A clock service that is *running* is not enough: one that cannot reach a time server leaves the
+# clock wherever it was (a fresh install's was hours out, and the agent refused every task as expired), so where timedatectl can say, the check is that
+# the clock is synchronised, and applying waits a little for it to be.
+f_timesync_running() { systemctl is-active --quiet systemd-timesyncd || systemctl is-active --quiet chrony || systemctl is-active --quiet ntpsec; }
+f_timesync_synced() { [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; }
+f_timesync_ok() { f_timesync_running && { ! command -v timedatectl >/dev/null 2>&1 || f_timesync_synced; }; }
+f_timesync_do() {
+  if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet ntpsec; then
+    dpkg -s systemd-timesyncd >/dev/null 2>&1 || apt-get install -y -qq systemd-timesyncd
+    systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+    systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
+  fi
+  timedatectl set-ntp true 2>/dev/null || true
+  command -v timedatectl >/dev/null 2>&1 || return 0
+  _ts=0
+  while [ "$_ts" -lt "${TIMESYNC_WAIT_SECONDS:-30}" ]; do f_timesync_synced && return 0; _ts=$((_ts + 1)); sleep 1; done
+  echo "  the clock service is running but the clock is not synchronising (can this machine reach a time server on UDP port 123?)" >&2
+  return 1
+}
 
 # Unused images cleared weekly by a systemd timer (a minimal Debian has no cron). Running containers' images are kept.
 f_prune_ok() { [ -e "$(p /etc/systemd/system/nuit-docker-prune.timer)" ]; }

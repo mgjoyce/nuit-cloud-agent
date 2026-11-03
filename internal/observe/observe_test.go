@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 const neigh = `10.10.10.162 dev br0 lladdr 8E:FF:E6:55:1B:1E REACHABLE
@@ -107,5 +108,24 @@ func TestTheVersionChangesWithTheFactNotWithTheNoise(t *testing.T) {
 	_, v4, _ := fake(strings.Replace(shuffled, "74:ac:b9:11:22:33", "74:ac:b9:11:22:34", 1), nil).Collect(context.Background(), Network)
 	if v3 == v2 || v4 == v2 || v3 == v4 {
 		t.Errorf("%q %q %q", v2, v3, v4)
+	}
+}
+
+func TestTheClockObservationSaysHowFarAheadThisMachineIsAndMovesInTenSecondSteps(t *testing.T) {
+	c := Collector{Clock: func() (time.Duration, bool) { return -2 * time.Hour, true }}
+	data, v, _ := c.Collect(context.Background(), Clock)
+	if f := data.(ClockFacts); f.AheadSeconds != 7200 || v != "c720" {
+		t.Errorf("%+v %q", data, v)
+	}
+	c.Clock = func() (time.Duration, bool) { return -7203 * time.Second, true }
+	if _, v2, _ := c.Collect(context.Background(), Clock); v2 != "c720" {
+		t.Errorf("a few seconds of drift changed the version: %q", v2)
+	}
+	c.Clock = func() (time.Duration, bool) { return 0, false }
+	if data, v3, _ := c.Collect(context.Background(), Clock); data != nil || v3 != "" {
+		t.Error("nothing is reported before the offset is known")
+	}
+	if !c.Known(Clock) {
+		t.Error("clock is in the catalog")
 	}
 }

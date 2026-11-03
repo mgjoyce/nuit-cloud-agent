@@ -36,6 +36,9 @@ type Client struct {
 	Observer Observer
 	// Now is the clock, replaceable in tests.
 	Now func() time.Time
+	// offset is the platform's time minus this machine's, as last measured from a check-in answer; offsetKnown says there has been one.
+	offset      time.Duration
+	offsetKnown bool
 
 	mu        sync.Mutex
 	fallbacks []string
@@ -181,6 +184,9 @@ type CheckInResponse struct {
 	FallbackAddresses *[]string `json:"fallbackAddresses,omitempty"`
 	// Observe is what the platform wants sent with the check-in and how often. Absent means unchanged; an empty list asks for none.
 	Observe *[]Want `json:"observe,omitempty"`
+	// ServerTime is the platform's time as it answered (RFC 3339): what a task's expiry is judged against, so a machine whose own clock is wrong still runs
+	// the tasks it is sent.
+	ServerTime string `json:"serverTime,omitempty"`
 }
 
 // Report is what the agent says about a task.
@@ -196,6 +202,15 @@ func (c *Client) Enroll(ctx context.Context, code, hostname string) (*EnrollResp
 	var out EnrollResponse
 	err := c.do(ctx, "/api/agent/enroll", map[string]string{"code": code, "hostname": hostname, "agentVersion": c.Version}, false, &out)
 	return &out, err
+}
+
+// ClockOffset is the platform's time minus this machine's, as measured at the last check-in, and whether there has been one. The agent judges a task's
+// expiry by this machine's time plus it: the clock of a freshly installed machine can be hours out, and then every task would look expired, including
+// the one that would put the clock right. The time comes over the same authenticated connection the tasks do.
+func (c *Client) ClockOffset() (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.offset, c.offsetKnown
 }
 
 // Observer reads one kind of observation.
@@ -295,9 +310,19 @@ type sentUpdate struct {
 func (c *Client) CheckIn(ctx context.Context) (*CheckInResponse, error) {
 	list, updates := c.due(ctx)
 	var out CheckInResponse
+	sent := c.now()
 	err := c.do(ctx, "/api/agent/checkin", checkInBody{Observations: list}, true, &out)
 	if err == nil {
 		c.mu.Lock()
+		// The platform's time, taken to be that of the middle of the exchange.
+		if t, perr := time.Parse(time.RFC3339Nano, out.ServerTime); perr == nil {
+			received := c.now()
+			if received.Before(sent) {
+				received = sent
+			}
+			c.offset = t.Sub(sent.Add(received.Sub(sent) / 2))
+			c.offsetKnown = true
+		}
 		if c.sent == nil {
 			c.sent = map[string]sentRecord{}
 		}

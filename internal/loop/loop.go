@@ -66,6 +66,8 @@ type Loop struct {
 	FallbackSink func(list []string)
 	// Route says how the platform was last reached, for the log.
 	Route func() string
+	// ClockOffset is the platform's time minus this machine's, if it has been measured. A task's expiry is judged by this machine's time plus it.
+	ClockOffset func() (time.Duration, bool)
 
 	mu      sync.Mutex
 	running bool
@@ -77,6 +79,17 @@ func (l *Loop) now() time.Time {
 		return l.Now()
 	}
 	return time.Now()
+}
+
+// platformNow is the time a task's expiry is judged by: the platform's, as far as it has told this machine.
+func (l *Loop) platformNow() time.Time {
+	now := l.now()
+	if l.ClockOffset != nil {
+		if d, ok := l.ClockOffset(); ok && d > -365*24*time.Hour && d < 365*24*time.Hour {
+			return now.Add(d)
+		}
+	}
+	return now
 }
 
 func (l *Loop) logf(format string, args ...any) {
@@ -109,7 +122,7 @@ func (l *Loop) Once(ctx context.Context) (time.Duration, error) {
 	for _, env := range resp.Tasks {
 		task, err := taskverify.Verify(env, l.State.TrustedKeys, taskverify.Context{
 			MachineID:   l.State.MachineID,
-			Now:         l.now(),
+			Now:         l.platformNow(),
 			AlreadySeen: l.State.HasSeen,
 			KnownTasks:  l.Runner.Names(),
 		})

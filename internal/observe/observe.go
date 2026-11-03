@@ -9,16 +9,22 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"net"
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Kind names.
-const Network = "network"
+const (
+	Network = "network"
+	// Clock is how far this machine's clock is ahead of the platform's.
+	Clock = "clock"
+)
 
 // Limits (the platform enforces the same ones again).
 const (
@@ -42,6 +48,11 @@ type Neighbour struct {
 	State     string `json:"state,omitempty"`
 }
 
+// ClockFacts is the `clock` observation: how many seconds this machine's clock is ahead of the platform's (negative: behind).
+type ClockFacts struct {
+	AheadSeconds int64 `json:"aheadSeconds"`
+}
+
 // NetworkFacts is the `network` observation.
 type NetworkFacts struct {
 	Interfaces []Interface `json:"interfaces"`
@@ -54,6 +65,8 @@ type Collector struct {
 	Run func(ctx context.Context, name string, args ...string) (string, error)
 	// Interfaces lists this machine's interfaces.
 	Interfaces func() []Interface
+	// Clock is the platform's time minus this machine's, once measured (the client does that at each check-in).
+	Clock func() (time.Duration, bool)
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -89,12 +102,24 @@ func realInterfaces() []Interface {
 }
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
-func (c Collector) Known(kind string) bool { return kind == Network }
+func (c Collector) Known(kind string) bool { return kind == Network || kind == Clock }
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
 // not changed has the same version and the agent can leave it unsent; it leaves out what changes without the fact changing (a neighbour's state flips between
 // REACHABLE and STALE all the time).
 func (c Collector) Collect(ctx context.Context, kind string) (any, string, error) {
+	if kind == Clock {
+		if c.Clock == nil {
+			return nil, "", nil
+		}
+		d, ok := c.Clock()
+		if !ok {
+			return nil, "", nil
+		}
+		ahead := int64(math.Round(-d.Seconds()))
+		// The version moves in steps of ten seconds, so ordinary drift costs nothing to report.
+		return ClockFacts{AheadSeconds: ahead}, "c" + strconv.FormatInt(int64(math.Round(float64(ahead)/10)), 10), nil
+	}
 	if kind != Network {
 		return nil, "", nil
 	}
