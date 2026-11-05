@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"net"
 	"os/exec"
@@ -24,6 +25,14 @@ const (
 	Network = "network"
 	// Clock is how far this machine's clock is ahead of the platform's.
 	Clock = "clock"
+	// Runtime is what the container runtime on this machine has left behind: supervisors that serve no container (and so hold disks locked).
+	Runtime = "runtime"
+)
+
+// RuntimeBinary and RuntimeRoot are where the container runtime and its state are on a machine it is installed on.
+const (
+	RuntimeBinary = "/usr/local/bin/oci-saas"
+	RuntimeRoot   = "/var/lib/oci-saas/state"
 )
 
 // Limits (the platform enforces the same ones again).
@@ -51,6 +60,11 @@ type Neighbour struct {
 // ClockFacts is the `clock` observation: how many seconds this machine's clock is ahead of the platform's (negative: behind).
 type ClockFacts struct {
 	AheadSeconds int64 `json:"aheadSeconds"`
+}
+
+// RuntimeFacts is the `runtime` observation: the processes (supervisors) the runtime's own `leftovers` command finds serving no container.
+type RuntimeFacts struct {
+	LeftoverSupervisors []int `json:"leftoverSupervisors"`
 }
 
 // NetworkFacts is the `network` observation.
@@ -102,7 +116,9 @@ func realInterfaces() []Interface {
 }
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
-func (c Collector) Known(kind string) bool { return kind == Network || kind == Clock }
+func (c Collector) Known(kind string) bool {
+	return kind == Network || kind == Clock || kind == Runtime
+}
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has
 // not changed has the same version and the agent can leave it unsent; it leaves out what changes without the fact changing (a neighbour's state flips between
@@ -120,11 +136,44 @@ func (c Collector) Collect(ctx context.Context, kind string) (any, string, error
 		// The version moves in steps of ten seconds, so ordinary drift costs nothing to report.
 		return ClockFacts{AheadSeconds: ahead}, "c" + strconv.FormatInt(int64(math.Round(float64(ahead)/10)), 10), nil
 	}
+	if kind == Runtime {
+		return c.runtime(ctx)
+	}
 	if kind != Network {
 		return nil, "", nil
 	}
 	facts := c.network(ctx)
 	return facts, facts.Version(), nil
+}
+
+// runtime asks the runtime what it has left behind. A machine without the runtime (or one whose answer cannot be read) reports nothing at all, which is
+// not the same as reporting none.
+func (c Collector) runtime(ctx context.Context) (any, string, error) {
+	out, err := c.Run(ctx, RuntimeBinary, "--root", RuntimeRoot, "leftovers")
+	if err != nil {
+		return nil, "", nil
+	}
+	var parsed struct {
+		Leftovers []struct {
+			PID int `json:"pid"`
+		} `json:"leftovers"`
+	}
+	if json.Unmarshal([]byte(out), &parsed) != nil {
+		return nil, "", nil
+	}
+	pids := []int{}
+	for _, l := range parsed.Leftovers {
+		pids = append(pids, l.PID)
+	}
+	sort.Ints(pids)
+	if len(pids) > 16 {
+		pids = pids[:16]
+	}
+	parts := make([]string, len(pids))
+	for i, p := range pids {
+		parts[i] = strconv.Itoa(p)
+	}
+	return RuntimeFacts{LeftoverSupervisors: pids}, "r" + strings.Join(parts, ","), nil
 }
 
 // Version is a short digest of the interfaces and the neighbours (address, hardware address, interface), in a fixed order and without the neighbours' state.

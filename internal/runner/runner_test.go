@@ -471,3 +471,32 @@ func TestFirewallConfirmReportsWhatTheConfirmerSaid(t *testing.T) {
 		t.Errorf("%+v", rep)
 	}
 }
+
+func repairTask(action any) *taskverify.Task {
+	return &taskverify.Task{Name: "runtime-repair", TimeoutSeconds: 30, Params: map[string]any{"action": action}}
+}
+
+func TestRuntimeRepairOnlyAsksTheRuntimeToListOrEnd(t *testing.T) {
+	r := newRunner()
+	var asked []string
+	r.Repair = func(_ context.Context, action string) (string, int, error) {
+		asked = append(asked, action)
+		return `{"leftovers":[{"pid":3023962}]}`, 0, nil
+	}
+	rep := r.Run(context.Background(), repairTask("list"))
+	if rep.Status != "done" || rep.Result.(map[string]any)["runtime"].(map[string]any)["leftovers"] == nil {
+		t.Errorf("%+v", rep)
+	}
+	for _, bad := range []any{"kill", "end; rm -rf /", "", nil, 3} {
+		if rep := r.Run(context.Background(), repairTask(bad)); rep.Status != "failed" {
+			t.Errorf("%v was accepted: %+v", bad, rep)
+		}
+	}
+	if len(asked) != 1 {
+		t.Errorf("the runtime was asked %v", asked)
+	}
+	r.Repair = func(context.Context, string) (string, int, error) { return "", 0, errors.New("the container runtime is not on this machine") }
+	if rep := r.Run(context.Background(), repairTask("end")); rep.Status != "failed" || !strings.Contains(rep.Output, "not on this machine") {
+		t.Errorf("%+v", rep)
+	}
+}

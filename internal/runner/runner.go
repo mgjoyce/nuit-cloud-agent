@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -56,6 +57,8 @@ type Runner struct {
 	Scan func(ctx context.Context, first, last string) (lanscan.Result, error)
 	// Smoke runs the runtime's smoke test in a namespace and returns what it printed and its exit status; injectable for tests.
 	Smoke func(ctx context.Context, namespace string) (string, int, error)
+	// Repair asks the container runtime about, or ends, supervisors that serve no container (action "list" or "end"); injectable for tests.
+	Repair func(ctx context.Context, action string) (string, int, error)
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -66,7 +69,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -97,6 +100,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.selfUpdate(ctx, task)
 	case "runtime-smoke":
 		return r.smoke(ctx, task)
+	case "runtime-repair":
+		return r.repair(ctx, task)
 	case "address-scan":
 		return r.scan(ctx, task)
 	case "ssh-confirm":
@@ -280,6 +285,60 @@ func RunSmoke(ctx context.Context, namespace string) (string, int, error) {
 		exit, err = ee.ExitCode(), nil
 	}
 	return string(out), exit, err
+}
+
+// The runtime's own program and state root on a machine the Nuit Container Service runtime is installed on.
+const (
+	RuntimeBinary = "/usr/local/bin/oci-saas"
+	RuntimeRoot   = "/var/lib/oci-saas/state"
+)
+
+// RunRepair is the real thing. The agent decides nothing about what is a leftover: that judgement is the runtime's own
+// (`leftovers` lists the supervisors it finds serving no container, ending none; `reconcile` is its startup sweep, which ends
+// those and nothing else that is alive), so the task can only ask the runtime to do what it already does by itself.
+func RunRepair(ctx context.Context, action string) (string, int, error) {
+	verb := map[string]string{"list": "leftovers", "end": "reconcile"}[action]
+	if verb == "" {
+		return "", 0, fmt.Errorf("unknown repair action %q", action)
+	}
+	if _, err := os.Stat(RuntimeBinary); err != nil {
+		return "", 0, fmt.Errorf("the container runtime is not on this machine (%s)", RuntimeBinary)
+	}
+	out, err := exec.CommandContext(ctx, RuntimeBinary, "--root", RuntimeRoot, verb).CombinedOutput()
+	exit := 0
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		exit, err = ee.ExitCode(), nil
+	}
+	return string(out), exit, err
+}
+
+// repair lists, or ends, the supervisors the runtime finds serving no container (see RunRepair). The only parameter is the
+// action; an end reports what the runtime says it ended.
+func (r Runner) repair(ctx context.Context, task *taskverify.Task) client.Report {
+	one := 1
+	action, _ := task.Params["action"].(string)
+	if action != "list" && action != "end" {
+		return client.Report{Status: "failed", ExitCode: &one, Output: `the repair action must be "list" or "end"`}
+	}
+	run := r.Repair
+	if run == nil {
+		run = RunRepair
+	}
+	out, exit, err := run(ctx, action)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	status := "done"
+	if exit != 0 {
+		status = "failed"
+	}
+	res := map[string]any{"action": action}
+	var parsed map[string]any
+	if json.Unmarshal([]byte(out), &parsed) == nil {
+		res["runtime"] = parsed
+	}
+	return client.Report{Status: status, ExitCode: &exit, Output: profiles.Truncate(out, 32*1024), Result: res}
 }
 
 // smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.

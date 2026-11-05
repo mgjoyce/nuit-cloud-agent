@@ -129,3 +129,24 @@ func TestTheClockObservationSaysHowFarAheadThisMachineIsAndMovesInTenSecondSteps
 		t.Error("clock is in the catalog")
 	}
 }
+
+func TestRuntimeObservationListsLeftoversAndStaysSilentWithoutTheRuntime(t *testing.T) {
+	c := Collector{Run: func(_ context.Context, name string, args ...string) (string, error) {
+		if name != RuntimeBinary || strings.Join(args, " ") != "--root "+RuntimeRoot+" leftovers" {
+			t.Errorf("asked %s %v", name, args)
+		}
+		return `{"leftovers":[{"pid":30},{"pid":4}]}`, nil
+	}}
+	data, version, err := c.Collect(context.Background(), Runtime)
+	if err != nil || version != "r4,30" || len(data.(RuntimeFacts).LeftoverSupervisors) != 2 {
+		t.Errorf("%v %q %v", data, version, err)
+	}
+	c.Run = func(context.Context, string, ...string) (string, error) { return `{"leftovers":[]}`, nil }
+	if data, version, _ := c.Collect(context.Background(), Runtime); version != "r" || len(data.(RuntimeFacts).LeftoverSupervisors) != 0 {
+		t.Errorf("none: %v %q", data, version)
+	}
+	c.Run = func(context.Context, string, ...string) (string, error) { return "", errors.New("no such file") }
+	if data, _, _ := c.Collect(context.Background(), Runtime); data != nil {
+		t.Errorf("a machine without the runtime reported %v", data)
+	}
+}
