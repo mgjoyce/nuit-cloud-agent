@@ -257,3 +257,63 @@ func TestSshdTriedByItsAbsolutePathWhenNotOnThePath(t *testing.T) {
 		t.Errorf("%+v", got)
 	}
 }
+
+func TestParseBusctlStringAndSleepMasked(t *testing.T) {
+	if ParseBusctlString("s \"suspend\"\n") != "suspend" || ParseBusctlString("s \"ignore\"") != "ignore" || ParseBusctlString("") != "" || ParseBusctlString("b true") != "" {
+		t.Error("busctl string property")
+	}
+	if m := ParseSleepMasked("masked\nmasked\nmasked\nmasked\n", 4); m == nil || !*m {
+		t.Errorf("all masked: %v", m)
+	}
+	if m := ParseSleepMasked("static\nmasked\nmasked\nmasked\n", 4); m == nil || *m {
+		t.Errorf("one not masked is not masked: %v", m)
+	}
+	if ParseSleepMasked("masked\n", 4) != nil {
+		t.Error("too few answers cannot be told")
+	}
+}
+
+func TestACloseableLaptopIsReportedWithWhatItWillDoWhenTheLidShuts(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, text string) {
+		p := filepath.Join(root, path)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("/sys/class/dmi/id/chassis_type", "10\n")
+	logind := map[string]string{"HandleLidSwitch": "suspend", "HandleLidSwitchExternalPower": "suspend", "HandleLidSwitchDocked": "ignore", "IdleAction": "ignore"}
+	s := Sources{
+		Root: root,
+		Run: func(_ context.Context, name string, args ...string) (string, error) {
+			switch name {
+			case "busctl":
+				return "s \"" + logind[args[len(args)-1]] + "\"\n", nil
+			case "systemctl":
+				return "enabled\nstatic\nstatic\nstatic\n", errors.New("exit status 1")
+			}
+			return "", errors.New("unexpected command " + name)
+		},
+	}
+	p := collectPower(context.Background(), s)
+	if !p.Laptop || p.Battery || p.Chassis != "10" || p.LidSwitch != "suspend" || p.LidSwitchExternalPower != "suspend" || p.LidSwitchDocked != "ignore" || p.IdleAction != "ignore" || p.SleepMasked == nil || *p.SleepMasked {
+		t.Errorf("%+v", p)
+	}
+}
+
+func TestAMachineWithABatteryIsALaptopWhateverItsChassisSays(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "/sys/class/power_supply/BAT0"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "/sys/class/dmi/id"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "/sys/class/dmi/id/chassis_type"), []byte("3\n"), 0o644)
+	none := func(context.Context, string, ...string) (string, error) { return "", errors.New("not available") }
+	p := collectPower(context.Background(), Sources{Root: root, Run: none})
+	if !p.Laptop || !p.Battery || p.LidSwitch != "" || p.SleepMasked != nil {
+		t.Errorf("a battery makes it a laptop, and what could not be asked is left blank, not guessed: %+v", p)
+	}
+	desktop := collectPower(context.Background(), Sources{Root: t.TempDir(), Run: none})
+	if desktop.Laptop {
+		t.Errorf("no chassis and no battery is not a laptop: %+v", desktop)
+	}
+}

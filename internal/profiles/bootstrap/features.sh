@@ -1141,3 +1141,38 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now nuit-cloud-housekeeping.timer
 }
+
+# A laptop shut on a shelf is a server whose lid switch suspends it: systemd's default is to sleep when the lid closes (and on idle with no one logged in on some installs), and a suspended
+# machine answers nothing (a laptop that held a Pi-hole went dark this way, and its agent, its checks and its DNS went with it). On a laptop this stops every sleep: the lid, idle and the sleep
+# keys are ignored and the sleep targets are masked so nothing else can suspend it either. A machine that is not a laptop is already as it should be.
+NCS_LID_CONF=/etc/systemd/logind.conf.d/10-nuit-cloud-lid.conf
+ncs_is_laptop() {
+  t="$(cat "$(p /sys/class/dmi/id/chassis_type)" 2>/dev/null || true)"
+  case "$t" in 8|9|10|14|30|31|32) return 0;; esac   # portable, laptop, notebook, sub-notebook, tablet, convertible, detachable
+  for b in "$(p /sys/class/power_supply)"/BAT*; do [ -e "$b" ] && return 0; done
+  return 1
+}
+f_ncs_laptop_awake_ok() {
+  ncs_is_laptop || return 0
+  c="$(p "$NCS_LID_CONF")"
+  [ -e "$c" ] || return 1
+  for line in HandleLidSwitch=ignore HandleLidSwitchExternalPower=ignore HandleLidSwitchDocked=ignore IdleAction=ignore; do grep -qx "$line" "$c" || return 1; done
+  for t in sleep suspend hibernate hybrid-sleep; do [ "$(systemctl is-enabled "$t.target" 2>/dev/null || true)" = masked ] || return 1; done
+  return 0
+}
+f_ncs_laptop_awake_do() {
+  mkdir -p "$(dirname "$(p "$NCS_LID_CONF")")"
+  cat >"$(p "$NCS_LID_CONF")" <<'CONF'
+# Written by nuit-cloud (the ncs_laptop_awake feature): a laptop used as a server must not sleep, whatever its lid or its idle time.
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+IdleAction=ignore
+CONF
+  systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+  # logind reads its configuration again on SIGHUP, without ending anyone's session
+  systemctl kill -s HUP systemd-logind.service >/dev/null 2>&1 || true
+}

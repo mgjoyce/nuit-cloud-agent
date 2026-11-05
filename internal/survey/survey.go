@@ -31,6 +31,7 @@ type Report struct {
 	Network     Network  `json:"network"`
 	Time        Time     `json:"time"`
 	SSH         SSH      `json:"ssh"`
+	Power       Power    `json:"power"`
 	Problems    []string `json:"collectionProblems,omitempty"` // things the survey could not read, so a gap is not mistaken for a clean bill
 }
 
@@ -109,6 +110,23 @@ type SSH struct {
 	// included files and its defaults; "file" is only what /etc/ssh/sshd_config says (a setting made elsewhere, or left to the
 	// default, is then ""); empty when neither could be read.
 	Source string `json:"source,omitempty"`
+}
+
+// Power is whether the machine is a laptop and whether it will sleep on its own. A laptop shut on a shelf as a server is suspended by systemd's default when its lid closes, and a
+// suspended machine answers nothing; the survey says what logind will do, and the platform says whether that is a problem.
+type Power struct {
+	// Laptop is true when the chassis type says portable (DMI chassis types 8, 9, 10, 14, 30, 31, 32) or a battery is present.
+	Laptop  bool `json:"laptop"`
+	Battery bool `json:"battery"`
+	// Chassis is the DMI chassis type number, "" when the machine does not say.
+	Chassis string `json:"chassis,omitempty"`
+	// What logind will do, as it answers (`HandleLidSwitch` and the others on login1's Manager): "ignore", "suspend", "poweroff", ...; "" when it could not be asked.
+	LidSwitch              string `json:"lidSwitch,omitempty"`
+	LidSwitchExternalPower string `json:"lidSwitchExternalPower,omitempty"`
+	LidSwitchDocked        string `json:"lidSwitchDocked,omitempty"`
+	IdleAction             string `json:"idleAction,omitempty"`
+	// SleepMasked is whether every sleep target (sleep, suspend, hibernate, hybrid-sleep) is masked, so nothing can suspend the machine; nil when it could not be told.
+	SleepMasked *bool `json:"sleepMasked"`
 }
 
 // Sources are where the survey reads from, so a test can point it at fixtures.
@@ -222,6 +240,7 @@ func Collect(ctx context.Context, s Sources) Report {
 	r.Network = collectNetwork(s, problem)
 	r.Time = collectTime(ctx, s)
 	r.SSH = collectSSH(ctx, s, problem)
+	r.Power = collectPower(ctx, s)
 	return r
 }
 
@@ -505,4 +524,56 @@ func ParseSSHDConfig(text string) SSH {
 		}
 	}
 	return c
+}
+
+// laptopChassis are the DMI chassis types of a portable machine: portable, laptop, notebook, sub-notebook, tablet, convertible, detachable.
+var laptopChassis = map[string]bool{"8": true, "9": true, "10": true, "14": true, "30": true, "31": true, "32": true}
+
+// ParseBusctlString reads `busctl get-property` output for a string property: `s "ignore"`.
+func ParseBusctlString(out string) string {
+	f := strings.Fields(strings.TrimSpace(out))
+	if len(f) == 2 && f[0] == "s" {
+		return strings.Trim(f[1], `"`)
+	}
+	return ""
+}
+
+// ParseSleepMasked reads `systemctl is-enabled` for the sleep targets, one state per line (the command exits non-zero for a masked unit but still prints it): true when every one is masked.
+func ParseSleepMasked(out string, targets int) *bool {
+	lines := strings.Fields(strings.TrimSpace(out))
+	if len(lines) < targets {
+		return nil
+	}
+	all := true
+	for _, l := range lines[:targets] {
+		if l != "masked" {
+			all = false
+		}
+	}
+	return &all
+}
+
+func collectPower(ctx context.Context, s Sources) Power {
+	var p Power
+	if text, err := s.read("/sys/class/dmi/id/chassis_type"); err == nil {
+		p.Chassis = strings.TrimSpace(text)
+	}
+	if matches, _ := filepath.Glob(s.path("/sys/class/power_supply/BAT*")); len(matches) > 0 {
+		p.Battery = true
+	}
+	p.Laptop = p.Battery || laptopChassis[p.Chassis]
+	ask := func(property string) string {
+		out, err := s.Run(ctx, "busctl", "--system", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", property)
+		if err != nil {
+			return ""
+		}
+		return ParseBusctlString(out)
+	}
+	p.LidSwitch = ask("HandleLidSwitch")
+	p.LidSwitchExternalPower = ask("HandleLidSwitchExternalPower")
+	p.LidSwitchDocked = ask("HandleLidSwitchDocked")
+	p.IdleAction = ask("IdleAction")
+	out, _ := s.Run(ctx, "systemctl", "is-enabled", "sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
+	p.SleepMasked = ParseSleepMasked(out, 4)
+	return p
 }
