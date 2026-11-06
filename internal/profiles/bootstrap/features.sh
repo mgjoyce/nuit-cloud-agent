@@ -9,9 +9,20 @@ JOURNAL_MAX="${JOURNAL_MAX:-50M}"
 f_user_ok() { id "$NC_USER" >/dev/null 2>&1; }
 f_user_do() { echo "  create $NC_USER and install the platform's SSH key (ssh-copy-id) first, then run this again" >&2; return 3; }
 
+# A feature that is about to download something first checks the machine can resolve the host it will use, so a machine with dead resolvers
+# is told so plainly (MANUAL, before anything is changed) instead of failing deep inside apt or curl. Call it only on the path that downloads.
+net_resolves() { # net_resolves [host]
+  _h="${1:-deb.debian.org}"
+  if command -v timeout >/dev/null 2>&1; then timeout 8 getent hosts "$_h" >/dev/null 2>&1; else getent hosts "$_h" >/dev/null 2>&1; fi && return 0
+  _ns="$(awk '$1=="nameserver" {printf "%s%s", sep, $2; sep=", "}' "$(p /etc/resolv.conf)" 2>/dev/null)"
+  echo "  this machine cannot resolve names (its resolvers: ${_ns:-none}): set them first (the platform's Name resolution panel, or the nuit-cloud-resolvers profile)" >&2
+  return 3
+}
+
 f_docker_ok() { command -v docker >/dev/null 2>&1 && systemctl is-enabled --quiet docker 2>/dev/null; }
 f_docker_do() {
   if ! command -v docker >/dev/null 2>&1; then
+    net_resolves get.docker.com || return 3
     command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }
     curl -fsSL https://get.docker.com | sh
   fi
@@ -39,7 +50,7 @@ JSON
 
 f_updates_ok() { dpkg -s unattended-upgrades >/dev/null 2>&1 && [ -e "$(p /etc/apt/apt.conf.d/20auto-upgrades)" ]; }
 f_updates_do() {
-  dpkg -s unattended-upgrades >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq unattended-upgrades; }
+  dpkg -s unattended-upgrades >/dev/null 2>&1 || { net_resolves || return 3; apt-get update -qq && apt-get install -y -qq unattended-upgrades; }
   printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' | write_if_missing /etc/apt/apt.conf.d/20auto-upgrades
 }
 
@@ -51,7 +62,7 @@ f_timesync_synced() { [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/nu
 f_timesync_ok() { f_timesync_running && { ! command -v timedatectl >/dev/null 2>&1 || f_timesync_synced; }; }
 f_timesync_do() {
   if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet ntpsec; then
-    dpkg -s systemd-timesyncd >/dev/null 2>&1 || apt-get install -y -qq systemd-timesyncd
+    dpkg -s systemd-timesyncd >/dev/null 2>&1 || { net_resolves || return 3; apt-get install -y -qq systemd-timesyncd; }
     systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
     systemctl restart systemd-timesyncd >/dev/null 2>&1 || true
   fi
@@ -128,7 +139,7 @@ f_pi_gpumem_do() {
 # Swap in compressed RAM, not on the SD card (slow, and swapping wears the card out). Replaces the SD swap file.
 f_pi_zram_ok() { dpkg -s zram-tools >/dev/null 2>&1 && ! systemctl is-enabled --quiet dphys-swapfile 2>/dev/null; }
 f_pi_zram_do() {
-  dpkg -s zram-tools >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zram-tools; }
+  dpkg -s zram-tools >/dev/null 2>&1 || { net_resolves || return 3; apt-get update -qq && apt-get install -y -qq zram-tools; }
   printf 'ALGO=zstd\nPERCENT=50\n' | write_if_missing /etc/default/zramswap
   systemctl disable --now dphys-swapfile 2>/dev/null || true
   systemctl enable --now zramswap
@@ -160,7 +171,7 @@ summary() {
 
 # What the agent and the runtime need on a minimal Debian: a way to fetch things over TLS, and the network tools.
 f_ncs_packages_ok() { dpkg -s ca-certificates >/dev/null 2>&1 && dpkg -s curl >/dev/null 2>&1 && dpkg -s iproute2 >/dev/null 2>&1 && dpkg -s iputils-arping >/dev/null 2>&1; }
-f_ncs_packages_do() { apt-get update -qq && apt-get install -y -qq ca-certificates curl iproute2 iputils-arping; }
+f_ncs_packages_do() { net_resolves || return 3; apt-get update -qq && apt-get install -y -qq ca-certificates curl iproute2 iputils-arping; }
 
 # Wired by default: at least one physical, non-wireless interface that is up and has an address. A cable is a person's job.
 f_ncs_wired_ok() {
@@ -296,7 +307,12 @@ f_oci_saas_runtime_do() {
   dedicated=
   if [ -n "$have" ] && ! printf '%s' "$have" | grep -qE ' v?2\.'; then dedicated=1; fi
 
-  apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd python3-minimal || return 1
+  _need=
+  for _pk in erofs-utils e2fsprogs iptables containernetworking-plugins xxd python3-minimal; do dpkg -s "$_pk" >/dev/null 2>&1 || _need=1; done
+  if [ -n "$_need" ]; then
+    net_resolves || return 3
+    apt-get update -qq && apt-get install -y -qq erofs-utils e2fsprogs iptables containernetworking-plugins xxd python3-minimal || return 1
+  fi
 
   work="$(mktemp -d)"
   tar -xzf "$NCS_RUNTIME_BUNDLE" -C "$work" || { rm -rf "$work"; echo "  the bundle is not a readable tarball" >&2; return 1; }
