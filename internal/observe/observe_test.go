@@ -3,6 +3,7 @@ package observe
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -138,11 +139,11 @@ func TestRuntimeObservationListsLeftoversAndStaysSilentWithoutTheRuntime(t *test
 		return `{"leftovers":[{"pid":30},{"pid":4}]}`, nil
 	}}
 	data, version, err := c.Collect(context.Background(), Runtime)
-	if err != nil || version != "r4,30" || len(data.(RuntimeFacts).LeftoverSupervisors) != 2 {
+	if err != nil || !versionOK.MatchString(version) || len(data.(RuntimeFacts).LeftoverSupervisors) != 2 {
 		t.Errorf("%v %q %v", data, version, err)
 	}
 	c.Run = func(context.Context, string, ...string) (string, error) { return `{"leftovers":[]}`, nil }
-	if data, version, _ := c.Collect(context.Background(), Runtime); version != "r" || len(data.(RuntimeFacts).LeftoverSupervisors) != 0 {
+	if data, version, _ := c.Collect(context.Background(), Runtime); !versionOK.MatchString(version) || len(data.(RuntimeFacts).LeftoverSupervisors) != 0 {
 		t.Errorf("none: %v %q", data, version)
 	}
 	c.Run = func(context.Context, string, ...string) (string, error) { return "", errors.New("no such file") }
@@ -187,6 +188,96 @@ func TestDNSObservationReadsTheResolversAndAsksEachOfThem(t *testing.T) {
 	}
 }
 
+var versionOK = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func TestRuntimeVersionIsAShortStableDigestOfWhatItReports(t *testing.T) {
+	good := strings.Repeat("ab12", 16)
+	run := `{"leftovers":[]}`
+	record := ""
+	c := Collector{
+		Run:              func(context.Context, string, ...string) (string, error) { return run, nil },
+		ReadBundleRecord: func() (string, error) { return record, nil },
+	}
+	ver := func() string { _, v, _ := c.Collect(context.Background(), Runtime); return v }
+	seen := map[string]bool{}
+	for _, r := range []string{`{"leftovers":[]}`, `{"leftovers":[{"pid":4}]}`, `{"leftovers":[{"pid":30},{"pid":4},{"pid":7}]}`} {
+		for _, rec := range []string{"", good} {
+			run, record = r, rec
+			v := ver()
+			if !versionOK.MatchString(v) || v != ver() || seen[v] {
+				t.Errorf("%s %q: version %q", r, rec, v)
+			}
+			seen[v] = true
+		}
+	}
+}
+
+func TestEveryKindsVersionIsOneThePlatformKeeps(t *testing.T) {
+	c := Collector{
+		Run: func(_ context.Context, name string, _ ...string) (string, error) {
+			if name == RuntimeBinary {
+				return `{"leftovers":[{"pid":30},{"pid":4}]}`, nil
+			}
+			return "", nil
+		},
+		Interfaces: func() []Interface {
+			return []Interface{{Name: "eth0", MAC: "aa:aa:aa:aa:aa:aa", Addresses: []string{"10.0.0.2"}}}
+		},
+		Clock:            func() (time.Duration, bool) { return -2 * time.Hour, true },
+		ReadResolvConf:   func() (string, error) { return "nameserver 10.0.0.1\n", nil },
+		Lookup:           func(context.Context, string, string) bool { return true },
+		ReadBundleRecord: func() (string, error) { return strings.Repeat("ab12", 16), nil },
+	}
+	for _, kind := range []string{Network, Clock, Runtime, DNS} {
+		_, v, err := c.Collect(context.Background(), kind)
+		if err != nil || !versionOK.MatchString(v) {
+			t.Errorf("%s: version %q (%v)", kind, v, err)
+		}
+	}
+}
+
+func TestRuntimeObservationReportsTheInstalledBundleOnlyWhenItIsAChecksum(t *testing.T) {
+	good := strings.Repeat("ab12", 16)
+	record := ""
+	var rerr error
+	c := Collector{
+		Run:              func(context.Context, string, ...string) (string, error) { return `{"leftovers":[{"pid":4}]}`, nil },
+		ReadBundleRecord: func() (string, error) { return record, rerr },
+	}
+	collect := func() (RuntimeFacts, string) {
+		d, v, _ := c.Collect(context.Background(), Runtime)
+		return d.(RuntimeFacts), v
+	}
+	record = good + "\n"
+	f, v1 := collect()
+	if f.BundleSHA256 != good || !versionOK.MatchString(v1) {
+		t.Errorf("good: %+v %q", f, v1)
+	}
+	if _, again := collect(); again != v1 {
+		t.Errorf("version changed with nothing changed: %q %q", v1, again)
+	}
+	record = strings.Repeat("cd34", 16)
+	if _, v2 := collect(); v2 == v1 {
+		t.Error("a changed bundle kept the same version")
+	}
+	for _, bad := range []string{"unknown\n", "abc123", strings.ToUpper(good), good + "0", ""} {
+		record = bad
+		f, v := collect()
+		if f.BundleSHA256 != "" || len(f.LeftoverSupervisors) != 1 || !versionOK.MatchString(v) {
+			t.Errorf("%q: %+v %q", bad, f, v)
+		}
+	}
+	record, rerr = good, errors.New("permission denied")
+	if f, _ := collect(); f.BundleSHA256 != "" || len(f.LeftoverSupervisors) != 1 {
+		t.Errorf("unreadable: %+v", f)
+	}
+	rerr = nil
+	c.Run = func(context.Context, string, ...string) (string, error) { return "", errors.New("no runtime") }
+	if d, _, _ := c.Collect(context.Background(), Runtime); d != nil {
+		t.Errorf("no runtime but the record exists reported %v", d)
+	}
+}
+
 func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
 	// A kind that is collected but not known is never asked for: it is silently never sent (the dns kind was missed this way in v0.3.28).
 	c := Collector{
@@ -195,6 +286,8 @@ func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
 		Clock:          func() (time.Duration, bool) { return 0, true },
 		ReadResolvConf: func() (string, error) { return "nameserver 10.0.0.1\n", nil },
 		Lookup:         func(context.Context, string, string) bool { return true },
+
+		ReadBundleRecord: func() (string, error) { return "", errors.New("none") },
 	}
 	for _, kind := range []string{Network, Clock, Runtime, DNS} {
 		if !c.Known(kind) {

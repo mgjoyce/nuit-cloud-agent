@@ -42,7 +42,11 @@ const publicTestName = "deb.debian.org"
 const (
 	RuntimeBinary = "/usr/local/bin/oci-saas"
 	RuntimeRoot   = "/var/lib/oci-saas/state"
+	// RuntimeBundleRecord holds the SHA-256 of the installed runtime bundle (or the word `unknown`), written by the oci_saas_runtime profile feature.
+	RuntimeBundleRecord = "/etc/oci-saas/installed-bundle"
 )
+
+var bundleSum = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Limits (the platform enforces the same ones again).
 const (
@@ -74,6 +78,8 @@ type ClockFacts struct {
 // RuntimeFacts is the `runtime` observation: the processes (supervisors) the runtime's own `leftovers` command finds serving no container.
 type RuntimeFacts struct {
 	LeftoverSupervisors []int `json:"leftoverSupervisors"`
+	// BundleSHA256 is the installed runtime bundle's checksum; empty (and left out) when unrecorded, unreadable or not a checksum.
+	BundleSHA256 string `json:"bundleSha256,omitempty"`
 }
 
 // DNSAnswer is one resolver's answer for one name: whether it returned an address.
@@ -115,6 +121,8 @@ type Collector struct {
 	Lookup func(ctx context.Context, resolver, name string) bool
 	// Clock is the platform's time minus this machine's, once measured (the client does that at each check-in).
 	Clock func() (time.Duration, bool)
+	// ReadBundleRecord returns the text of the installed-bundle record; nil means no record is read.
+	ReadBundleRecord func() (string, error)
 }
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
@@ -127,7 +135,10 @@ func realRun(ctx context.Context, name string, args ...string) (string, error) {
 
 // Real is a Collector on this machine.
 func Real() Collector {
-	return Collector{Run: realRun, Interfaces: realInterfaces}
+	return Collector{Run: realRun, Interfaces: realInterfaces, ReadBundleRecord: func() (string, error) {
+		b, err := os.ReadFile(RuntimeBundleRecord)
+		return string(b), err
+	}}
 }
 
 func realInterfaces() []Interface {
@@ -210,7 +221,15 @@ func (c Collector) runtime(ctx context.Context) (any, string, error) {
 	for i, p := range pids {
 		parts[i] = strconv.Itoa(p)
 	}
-	return RuntimeFacts{LeftoverSupervisors: pids}, "r" + strings.Join(parts, ","), nil
+	bundle := ""
+	if c.ReadBundleRecord != nil {
+		if text, err := c.ReadBundleRecord(); err == nil && bundleSum.MatchString(strings.TrimSpace(text)) {
+			bundle = strings.TrimSpace(text)
+		}
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, ",") + "|" + bundle))
+	version := "r" + hex.EncodeToString(sum[:])[:12]
+	return RuntimeFacts{LeftoverSupervisors: pids, BundleSHA256: bundle}, version, nil
 }
 
 var resolverLine = regexp.MustCompile(`^nameserver\s+(\d{1,3}(?:\.\d{1,3}){3})\s*$`)
