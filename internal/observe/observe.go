@@ -151,7 +151,7 @@ func realInterfaces() []Interface {
 
 // Known says whether this agent can collect a kind. A kind the platform asks for that is not here is simply not sent.
 func (c Collector) Known(kind string) bool {
-	return kind == Network || kind == Clock || kind == Runtime
+	return kind == Network || kind == Clock || kind == Runtime || kind == DNS
 }
 
 // Collect reads one kind: what is sent as the observation's `data`, and its version. The version is a digest of what the fact *is*, so a fact that has

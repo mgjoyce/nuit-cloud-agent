@@ -154,8 +154,10 @@ func TestRuntimeObservationListsLeftoversAndStaysSilentWithoutTheRuntime(t *test
 func TestDNSObservationReadsTheResolversAndAsksEachOfThem(t *testing.T) {
 	asked := map[string]bool{}
 	c := Collector{
-		PlatformHost:   "agent.ops.example.com",
-		ReadResolvConf: func() (string, error) { return "# x\ndomain internal.example.com\nnameserver 10.10.10.151\nnameserver 10.20.0.22\nnameserver 1.2.3.4\nnameserver 9.9.9.9\n", nil },
+		PlatformHost: "agent.ops.example.com",
+		ReadResolvConf: func() (string, error) {
+			return "# x\ndomain internal.example.com\nnameserver 10.10.10.151\nnameserver 10.20.0.22\nnameserver 1.2.3.4\nnameserver 9.9.9.9\n", nil
+		},
 		Lookup: func(_ context.Context, resolver, name string) bool {
 			asked[resolver+" "+name] = true
 			return resolver == "10.20.0.22" && name != "agent.ops.example.com"
@@ -182,5 +184,27 @@ func TestDNSObservationReadsTheResolversAndAsksEachOfThem(t *testing.T) {
 	c.ReadResolvConf = func() (string, error) { return "", errors.New("no file") }
 	if d, _, _ := c.Collect(context.Background(), DNS); d != nil {
 		t.Errorf("an unreadable resolv.conf reported %v", d)
+	}
+}
+
+func TestEveryKindTheAgentCanCollectIsOneItSaysItKnows(t *testing.T) {
+	// A kind that is collected but not known is never asked for: it is silently never sent (the dns kind was missed this way in v0.3.28).
+	c := Collector{
+		Run:            func(context.Context, string, ...string) (string, error) { return `{"leftovers":[]}`, nil },
+		Interfaces:     func() []Interface { return nil },
+		Clock:          func() (time.Duration, bool) { return 0, true },
+		ReadResolvConf: func() (string, error) { return "nameserver 10.0.0.1\n", nil },
+		Lookup:         func(context.Context, string, string) bool { return true },
+	}
+	for _, kind := range []string{Network, Clock, Runtime, DNS} {
+		if !c.Known(kind) {
+			t.Errorf("%s is not a known kind", kind)
+		}
+		if data, version, err := c.Collect(context.Background(), kind); err != nil || data == nil || version == "" {
+			t.Errorf("%s collected nothing: %v %q %v", kind, data, version, err)
+		}
+	}
+	if c.Known("invented") {
+		t.Error("an invented kind is known")
 	}
 }
