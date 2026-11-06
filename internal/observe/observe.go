@@ -1,7 +1,9 @@
 // Package observe collects the small read-only facts the platform asks the agent to attach to its check-in (ADR 0001, amendment: observations).
 //
 // It is deliberately not a collector: nothing runs between check-ins, nothing is sent that the platform did not ask for, and the kinds are a closed list
-// compiled in here. A read is made just before a call and is passive: the interface list and the neighbour table, never a probe.
+// compiled in here. A read is made just before a call and is passive: the interface list and the neighbour table, never a probe. The one exception
+// is `dns`, which asks the machine's own resolvers two questions (the platform's name and a public one) because whether a name resolves can only be
+// found out by asking; it sends nothing but those queries, and only when the platform lists the kind.
 package observe
 
 import (
@@ -10,8 +12,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -27,7 +31,12 @@ const (
 	Clock = "clock"
 	// Runtime is what the container runtime on this machine has left behind: supervisors that serve no container (and so hold disks locked).
 	Runtime = "runtime"
+	// DNS is which resolvers this machine uses and whether each one answers for the platform's own name and for a public one.
+	DNS = "dns"
 )
+
+// publicTestName is a public name every Debian machine needs to reach today (its package mirror); a resolver that cannot answer it cannot install anything.
+const publicTestName = "deb.debian.org"
 
 // RuntimeBinary and RuntimeRoot are where the container runtime and its state are on a machine it is installed on.
 const (
@@ -67,6 +76,25 @@ type RuntimeFacts struct {
 	LeftoverSupervisors []int `json:"leftoverSupervisors"`
 }
 
+// DNSAnswer is one resolver's answer for one name: whether it returned an address.
+type DNSAnswer struct {
+	Resolver string `json:"resolver"`
+	OK       bool   `json:"ok"`
+}
+
+// DNSTest is one name asked of every resolver.
+type DNSTest struct {
+	Name    string      `json:"name"`
+	Answers []DNSAnswer `json:"answers"`
+}
+
+// DNSFacts is the `dns` observation: the resolvers /etc/resolv.conf lists (at most three are used) and what each answered.
+type DNSFacts struct {
+	Resolvers []string  `json:"resolvers"`
+	Search    string    `json:"search,omitempty"`
+	Tests     []DNSTest `json:"tests"`
+}
+
 // NetworkFacts is the `network` observation.
 type NetworkFacts struct {
 	Interfaces []Interface `json:"interfaces"`
@@ -79,6 +107,12 @@ type Collector struct {
 	Run func(ctx context.Context, name string, args ...string) (string, error)
 	// Interfaces lists this machine's interfaces.
 	Interfaces func() []Interface
+	// PlatformHost is the name the agent calls the platform by; asked of every resolver, since a machine that cannot resolve it cannot find the platform by name.
+	PlatformHost string
+	// ReadResolvConf returns /etc/resolv.conf's text.
+	ReadResolvConf func() (string, error)
+	// Lookup asks one resolver (an IPv4 address) for the addresses of a name.
+	Lookup func(ctx context.Context, resolver, name string) bool
 	// Clock is the platform's time minus this machine's, once measured (the client does that at each check-in).
 	Clock func() (time.Duration, bool)
 }
@@ -139,6 +173,9 @@ func (c Collector) Collect(ctx context.Context, kind string) (any, string, error
 	if kind == Runtime {
 		return c.runtime(ctx)
 	}
+	if kind == DNS {
+		return c.dns(ctx)
+	}
 	if kind != Network {
 		return nil, "", nil
 	}
@@ -174,6 +211,72 @@ func (c Collector) runtime(ctx context.Context) (any, string, error) {
 		parts[i] = strconv.Itoa(p)
 	}
 	return RuntimeFacts{LeftoverSupervisors: pids}, "r" + strings.Join(parts, ","), nil
+}
+
+var resolverLine = regexp.MustCompile(`^nameserver\s+(\d{1,3}(?:\.\d{1,3}){3})\s*$`)
+var ipv4Name = regexp.MustCompile(`^\d{1,3}(?:\.\d{1,3}){3}$`)
+
+// dns reads the resolvers the machine uses and asks each of them for a platform name and a public one, two seconds apiece. Nothing is
+// changed; what is learned is whether the machine can find the platform and its package source by name, and through which resolver.
+func (c Collector) dns(ctx context.Context) (any, string, error) {
+	read := c.ReadResolvConf
+	if read == nil {
+		read = func() (string, error) { b, err := os.ReadFile("/etc/resolv.conf"); return string(b), err }
+	}
+	text, err := read()
+	if err != nil {
+		return nil, "", nil
+	}
+	facts := DNSFacts{Resolvers: []string{}, Tests: []DNSTest{}}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if m := resolverLine.FindStringSubmatch(line); m != nil && len(facts.Resolvers) < 3 {
+			facts.Resolvers = append(facts.Resolvers, m[1])
+		} else if (strings.HasPrefix(line, "search ") || strings.HasPrefix(line, "domain ")) && facts.Search == "" {
+			facts.Search = strings.TrimSpace(line[strings.Index(line, " ")+1:])
+		}
+	}
+	names := []string{}
+	if c.PlatformHost != "" && !ipv4Name.MatchString(c.PlatformHost) {
+		names = append(names, c.PlatformHost)
+	}
+	names = append(names, publicTestName)
+	lookup := c.Lookup
+	if lookup == nil {
+		lookup = realLookup
+	}
+	for _, name := range names {
+		test := DNSTest{Name: name, Answers: []DNSAnswer{}}
+		for _, r := range facts.Resolvers {
+			test.Answers = append(test.Answers, DNSAnswer{Resolver: r, OK: lookup(ctx, r, name)})
+		}
+		facts.Tests = append(facts.Tests, test)
+	}
+	return facts, facts.version(), nil
+}
+
+// version is a digest of what the resolvers are and whether each answered, so a machine whose resolution does not change sends nothing.
+func (f DNSFacts) version() string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s", strings.Join(f.Resolvers, ","), f.Search)
+	for _, t := range f.Tests {
+		fmt.Fprintf(h, "|%s", t.Name)
+		for _, a := range t.Answers {
+			fmt.Fprintf(h, ",%s=%t", a.Resolver, a.OK)
+		}
+	}
+	return "d" + hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// realLookup asks one resolver directly (not the machine's own configuration) for a name's addresses.
+func realLookup(ctx context.Context, resolver, name string) bool {
+	r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "udp", net.JoinHostPort(resolver, "53"))
+	}}
+	ctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+	addrs, err := r.LookupHost(ctx, name)
+	return err == nil && len(addrs) > 0
 }
 
 // Version is a short digest of the interfaces and the neighbours (address, hardware address, interface), in a fixed order and without the neighbours' state.

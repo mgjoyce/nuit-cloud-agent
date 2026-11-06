@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -162,6 +163,9 @@ func run(args []string) error {
 	c.SetFallbacks(st.Fallbacks)
 	facts := observe.Real()
 	facts.Clock = c.ClockOffset
+	if u, err := url.Parse(c.BaseURL); err == nil {
+		facts.PlatformHost = u.Hostname()
+	}
 	c.Observer = facts
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

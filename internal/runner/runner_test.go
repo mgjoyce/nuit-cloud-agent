@@ -495,8 +495,26 @@ func TestRuntimeRepairOnlyAsksTheRuntimeToListOrEnd(t *testing.T) {
 	if len(asked) != 1 {
 		t.Errorf("the runtime was asked %v", asked)
 	}
-	r.Repair = func(context.Context, string) (string, int, error) { return "", 0, errors.New("the container runtime is not on this machine") }
+	r.Repair = func(context.Context, string) (string, int, error) {
+		return "", 0, errors.New("the container runtime is not on this machine")
+	}
 	if rep := r.Run(context.Background(), repairTask("end")); rep.Status != "failed" || !strings.Contains(rep.Output, "not on this machine") {
 		t.Errorf("%+v", rep)
+	}
+}
+
+func TestTheResolversReachTheScriptsAsEnvironmentAndOnlyAsAddresses(t *testing.T) {
+	f := &fakeProfiles{res: profiles.Result{Features: []profiles.Feature{{Name: "ncs_resolvers", Status: "applied"}}}}
+	r := withProfiles(f)
+	task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-resolvers", "dns": map[string]any{"servers": []any{"10.20.0.22", "10.20.0.67"}}}}
+	if rep := r.Run(context.Background(), task); rep.Status != "done" || len(f.env) != 1 || f.env[0] != "NCS_DNS_SERVERS=10.20.0.22 10.20.0.67" {
+		t.Errorf("%+v env=%v", rep, f.env)
+	}
+	for _, bad := range []any{nil, []any{}, []any{"dns.example.com"}, []any{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}, []any{"10.0.0.1; rm"}, []any{"999.1.1.1"}} {
+		f.env = nil
+		task := &taskverify.Task{Name: "profile-apply", TimeoutSeconds: 30, Params: map[string]any{"profile": "nuit-cloud-resolvers", "dns": map[string]any{"servers": bad}}}
+		if rep := r.Run(context.Background(), task); rep.Status != "failed" || len(f.env) != 0 {
+			t.Errorf("%v was accepted: %+v env=%v", bad, rep, f.env)
+		}
 	}
 }

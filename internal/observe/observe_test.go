@@ -150,3 +150,37 @@ func TestRuntimeObservationListsLeftoversAndStaysSilentWithoutTheRuntime(t *test
 		t.Errorf("a machine without the runtime reported %v", data)
 	}
 }
+
+func TestDNSObservationReadsTheResolversAndAsksEachOfThem(t *testing.T) {
+	asked := map[string]bool{}
+	c := Collector{
+		PlatformHost:   "agent.ops.example.com",
+		ReadResolvConf: func() (string, error) { return "# x\ndomain internal.example.com\nnameserver 10.10.10.151\nnameserver 10.20.0.22\nnameserver 1.2.3.4\nnameserver 9.9.9.9\n", nil },
+		Lookup: func(_ context.Context, resolver, name string) bool {
+			asked[resolver+" "+name] = true
+			return resolver == "10.20.0.22" && name != "agent.ops.example.com"
+		},
+	}
+	data, version, err := c.Collect(context.Background(), DNS)
+	f, ok := data.(DNSFacts)
+	if err != nil || !ok || len(f.Resolvers) != 3 || f.Search != "internal.example.com" || len(f.Tests) != 2 || f.Tests[0].Name != "agent.ops.example.com" || f.Tests[1].Name != "deb.debian.org" {
+		t.Fatalf("%+v %q %v", data, version, err)
+	}
+	if f.Tests[0].Answers[1].OK || !f.Tests[1].Answers[1].OK || f.Tests[1].Answers[0].OK || len(asked) != 6 {
+		t.Errorf("answers %+v asked %v", f.Tests, asked)
+	}
+	_, same, _ := c.Collect(context.Background(), DNS)
+	c.Lookup = func(context.Context, string, string) bool { return true }
+	_, changed, _ := c.Collect(context.Background(), DNS)
+	if same != version || changed == version {
+		t.Errorf("version %q %q %q", version, same, changed)
+	}
+	c.PlatformHost = "10.10.10.140"
+	if d, _, _ := c.Collect(context.Background(), DNS); len(d.(DNSFacts).Tests) != 1 {
+		t.Errorf("an address is not a name to ask for: %+v", d)
+	}
+	c.ReadResolvConf = func() (string, error) { return "", errors.New("no file") }
+	if d, _, _ := c.Collect(context.Background(), DNS); d != nil {
+		t.Errorf("an unreadable resolv.conf reported %v", d)
+	}
+}

@@ -1176,3 +1176,39 @@ CONF
   # logind reads its configuration again on SIGHUP, without ending anyone's session
   systemctl kill -s HUP systemd-logind.service >/dev/null 2>&1 || true
 }
+
+# ─── Working name resolution for a machine with a static address ──────────────────────────────────────────────────────────────────────────
+# A machine that took its resolvers from DHCP and was then given a static address keeps the file dhcpcd wrote, naming whatever DHCP offered
+# that day (found 6 Nov 2026: every machine still listed two Pi-holes that had been removed, so none could resolve a name). The platform
+# names the resolvers (NCS_DNS_SERVERS, one to three IPv4 addresses, taken from its own setting and never from a request) and this makes
+# /etc/resolv.conf list exactly those, in that order. A `domain`/`search` line already there is kept. The same servers go in
+# resolv.conf.head, which dhcpcd puts first whenever it writes the file again, so a later lease cannot put the dead ones back in front.
+# A resolv.conf that is a symlink (systemd-resolved) is somebody else's to manage: left to a person.
+NCS_RESOLV_CONF="${NCS_RESOLV_CONF:-/etc/resolv.conf}"
+resolver_words() { printf '%s' "${NCS_DNS_SERVERS:-}" | tr ',' ' ' | tr -s ' ' '\n' | grep -v '^$'; }
+resolvers_valid() {
+  n=0
+  for a in $(resolver_words); do
+    printf '%s' "$a" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    n=$((n + 1))
+  done
+  [ "$n" -ge 1 ] && [ "$n" -le 3 ]
+}
+resolvers_current() { awk '$1=="nameserver" {print $2}' "$(p "$NCS_RESOLV_CONF")" 2>/dev/null; }
+f_ncs_resolvers_ok() {
+  [ -n "${NCS_DNS_SERVERS:-}" ] || return 0   # nothing is asked: there is nothing to be out of line with
+  resolvers_valid || return 1
+  [ "$(resolvers_current)" = "$(resolver_words)" ]
+}
+f_ncs_resolvers_do() {
+  resolvers_valid || { echo "  the task carries no usable resolver list (one to three IPv4 addresses)" >&2; return 3; }
+  f="$(p "$NCS_RESOLV_CONF")"
+  if [ -L "$f" ]; then echo "  $NCS_RESOLV_CONF is a symlink (systemd-resolved?): set its resolvers where it is managed, then run this again" >&2; return 3; fi
+  mkdir -p "$(dirname "$f")"
+  keep="$(awk '$1=="domain" || $1=="search"' "$f" 2>/dev/null || true)"
+  names="$(resolver_words | sed 's/^/nameserver /')"
+  tmp="$f.nuit-cloud.$$"
+  { echo "# Written by nuit-cloud (the ncs_resolvers feature): the platform's resolvers."; [ -z "$keep" ] || echo "$keep"; echo "$names"; } >"$tmp" && chmod 644 "$tmp" && mv "$tmp" "$f" || return 1
+  { echo "# Written by nuit-cloud (the ncs_resolvers feature): kept first when dhcpcd writes resolv.conf again."; echo "$names"; } >"$f.head" || return 1
+  echo "  resolvers set to: $(resolver_words | tr '\n' ' ')"
+}

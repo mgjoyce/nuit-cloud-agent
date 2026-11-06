@@ -155,6 +155,13 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		}
 		env = append(env, "NCS_PLATFORM_SSH_KEY="+key)
 	}
+	if raw, ok := task.Params["dns"].(map[string]any); ok {
+		servers, err := dnsServers(raw)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		env = append(env, "NCS_DNS_SERVERS="+strings.Join(servers, " "))
+	}
 	if raw, ok := task.Params["ssh"].(map[string]any); ok {
 		fingerprints, err := sshFingerprints(raw)
 		if err != nil {
@@ -471,6 +478,24 @@ func firewallEnvironment(raw map[string]any) ([]string, error) {
 		}
 	}
 	return []string{"NCS_FIREWALL_TCP=" + strings.Join(ports, ","), "NCS_FIREWALL_SSH_FROM=" + strings.Join(from, ",")}, nil
+}
+
+// dnsServers is the platform's list of resolvers for the machine: one to three IPv4 addresses, nothing else (it goes into a file the machine
+// resolves every name through).
+func dnsServers(raw map[string]any) ([]string, error) {
+	list, _ := raw["servers"].([]any)
+	if len(list) < 1 || len(list) > 3 {
+		return nil, fmt.Errorf("the task carries no usable resolver list (one to three IPv4 addresses)")
+	}
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		s, _ := v.(string)
+		if !ipv4.MatchString(s) || net.ParseIP(s) == nil {
+			return nil, fmt.Errorf("the task carries no usable resolver list (one to three IPv4 addresses)")
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // loginKey is one ssh-ed25519 public key line with an optional comment: nothing that could carry options or a second line.
