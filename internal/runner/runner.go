@@ -18,6 +18,7 @@ import (
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/hostname"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
@@ -59,6 +60,8 @@ type Runner struct {
 	Smoke func(ctx context.Context, namespace string) (string, int, error)
 	// Repair asks the container runtime about, or ends, supervisors that serve no container (action "list" or "end"); injectable for tests.
 	Repair func(ctx context.Context, action string) (string, int, error)
+	// SetHostname changes the machine's hostname (hostname.Setter; injectable so tests touch no real machine).
+	SetHostname func(ctx context.Context, name string) (hostname.Result, error)
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -69,7 +72,7 @@ func (r Runner) RestartRequested() bool { return r.Restart != nil && r.Restart.L
 
 // Names is the catalog: what this agent can do.
 func (r Runner) Names() []string {
-	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair"}
+	return []string{"ping", "survey", "profile-check", "profile-apply", "update-agent", "runtime-smoke", "address-scan", "ssh-confirm", "firewall-confirm", "runtime-repair", "set-hostname"}
 }
 
 // Run performs one task, bounded by its timeout, and says how it went. It never panics the agent: a task that blows up is a
@@ -102,6 +105,8 @@ func (r Runner) Run(ctx context.Context, task *taskverify.Task) (report client.R
 		return r.smoke(ctx, task)
 	case "runtime-repair":
 		return r.repair(ctx, task)
+	case "set-hostname":
+		return r.setHostname(ctx, task)
 	case "address-scan":
 		return r.scan(ctx, task)
 	case "ssh-confirm":
@@ -346,6 +351,26 @@ func (r Runner) repair(ctx context.Context, task *taskverify.Task) client.Report
 		res["runtime"] = parsed
 	}
 	return client.Report{Status: status, ExitCode: &exit, Output: profiles.Truncate(out, 32*1024), Result: res}
+}
+
+// setHostname re-validates the platform's parameter (one DNS label, nothing else) and changes the hostname.
+func (r Runner) setHostname(ctx context.Context, task *taskverify.Task) client.Report {
+	one := 1
+	name, err := hostname.Validate(task.Params)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	set := r.SetHostname
+	if set == nil {
+		set = hostname.Setter{}.Set
+	}
+	res, err := set(ctx, name)
+	if err != nil {
+		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+	}
+	zero := 0
+	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("hostname %s: %s (was %s, by %s)", res.Hostname, res.Outcome, res.Previous, res.Method),
+		Result: map[string]any{"previous": res.Previous, "hostname": res.Hostname, "outcome": res.Outcome, "method": res.Method}}
 }
 
 // smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.

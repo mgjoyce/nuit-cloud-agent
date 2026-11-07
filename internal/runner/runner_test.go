@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/hostname"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/runtimeinstall"
@@ -500,6 +501,42 @@ func TestRuntimeRepairOnlyAsksTheRuntimeToListOrEnd(t *testing.T) {
 	}
 	if rep := r.Run(context.Background(), repairTask("end")); rep.Status != "failed" || !strings.Contains(rep.Output, "not on this machine") {
 		t.Errorf("%+v", rep)
+	}
+}
+
+func TestSetHostnameValidatesAgainAndOnlyThenChangesAnything(t *testing.T) {
+	r := newRunner()
+	var asked []string
+	r.SetHostname = func(_ context.Context, name string) (hostname.Result, error) {
+		asked = append(asked, name)
+		return hostname.Result{Previous: "old", Hostname: name, Outcome: "changed", Method: "hostnamectl"}, nil
+	}
+	task := func(p map[string]any) *taskverify.Task {
+		return &taskverify.Task{Name: "set-hostname", TimeoutSeconds: 60, Params: p}
+	}
+	rep := r.Run(context.Background(), task(map[string]any{"hostname": " Box-2 "}))
+	res, _ := rep.Result.(map[string]any)
+	if rep.Status != "done" || res["hostname"] != "box-2" || res["previous"] != "old" || res["outcome"] != "changed" || res["method"] != "hostnamectl" {
+		t.Errorf("%+v", rep)
+	}
+	for _, bad := range []map[string]any{{}, {"hostname": "a.b"}, {"hostname": "-a"}, {"hostname": "a", "x": 1}, {"hostname": 3}} {
+		if rep := r.Run(context.Background(), task(bad)); rep.Status != "failed" {
+			t.Errorf("%v was accepted: %+v", bad, rep)
+		}
+	}
+	if len(asked) != 1 || asked[0] != "box-2" {
+		t.Errorf("the machine was asked to change to %v", asked)
+	}
+	r.SetHostname = func(context.Context, string) (hostname.Result, error) { return hostname.Result{}, errors.New("no") }
+	if rep := r.Run(context.Background(), task(map[string]any{"hostname": "box"})); rep.Status != "failed" {
+		t.Errorf("%+v", rep)
+	}
+	found := false
+	for _, n := range r.Names() {
+		found = found || n == "set-hostname"
+	}
+	if !found {
+		t.Error("set-hostname is not in the catalog")
 	}
 }
 
