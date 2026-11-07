@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/controlplane"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/fwconfirm"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/hostname"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/lanscan"
@@ -49,7 +50,9 @@ type Runner struct {
 	PlatformURL string
 	// Runtime stages the Nuit Container Service runtime's files for a profile-apply that carries them; injectable for tests.
 	Runtime RuntimeStager
-	Updater SelfUpdater
+	// ControlPlane gives the nuit-cloud-control-plane profile the secrets it needs (never through the task).
+	ControlPlane ControlPlaneProvisioner
+	Updater      SelfUpdater
 	// SSHConfirm completes the SSH hardening: re-checks what sshd uses and cancels the rollback timer; injectable for tests.
 	SSHConfirm func(ctx context.Context) (sshconfirm.Result, error)
 	// FirewallConfirm completes the baseline firewall: checks the table is loaded and cancels the rollback timer; injectable for tests.
@@ -199,9 +202,35 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 		// a check needs no files: it only asks whether what is installed is healthy
 		env = append(env, "NCS_RUNTIME_BUNDLE_SHA256="+stringParam(raw, "bundleSha256"))
 	}
+	scrub := func(s string) string { return s }
+	if raw, ok := task.Params["controlPlane"]; ok || name == controlPlaneProfile {
+		if name != controlPlaneProfile {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "controlPlane belongs to the " + controlPlaneProfile + " profile only"}
+		}
+		m, _ := raw.(map[string]any)
+		params, err := controlplane.ParseParams(m)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		}
+		if r.ControlPlane == nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: "this agent was built without control-plane support"}
+		}
+		// The secrets are read here, with the agent's own credential, and written here; the scripts get only where they are.
+		cpEnv, cpScrub, err := r.ControlPlane.Prepare(ctx, params, apply)
+		if err != nil {
+			return client.Report{Status: "failed", ExitCode: &one, Output: cpScrub(err.Error())}
+		}
+		env, scrub = append(env, cpEnv...), cpScrub
+	}
 	res, exit, err := r.Profiles.Run(ctx, name, apply, env...)
 	if err != nil {
-		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
+		return client.Report{Status: "failed", ExitCode: &one, Output: scrub(err.Error())}
+	}
+	res.Output = scrub(res.Output)
+	for i := range res.Features {
+		for j := range res.Features[i].Notes {
+			res.Features[i].Notes[j] = scrub(res.Features[i].Notes[j])
+		}
 	}
 	summary := summarise(res)
 	for _, f := range res.Features {
@@ -216,6 +245,15 @@ func (r Runner) profile(ctx context.Context, task *taskverify.Task) client.Repor
 }
 
 func stringParam(m map[string]any, k string) string { s, _ := m[k].(string); return s }
+
+const controlPlaneProfile = "nuit-cloud-control-plane"
+
+// ControlPlaneProvisioner reads the platform's services configuration and, for an apply, writes it to root-only files
+// (controlplane.Provisioner; injectable so tests touch no real machine). It returns the non-secret environment for the scripts and a
+// function that removes any secret value from a text.
+type ControlPlaneProvisioner interface {
+	Prepare(ctx context.Context, p controlplane.Params, apply bool) (env []string, scrub func(string) string, err error)
+}
 
 // RuntimeStager downloads and checks the runtime's files (runtimeinstall.Stager).
 type RuntimeStager interface {

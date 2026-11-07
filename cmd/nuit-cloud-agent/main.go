@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/mgjoyce/nuit-cloud-agent/internal/client"
+	"github.com/mgjoyce/nuit-cloud-agent/internal/controlplane"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/loop"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/observe"
 	"github.com/mgjoyce/nuit-cloud-agent/internal/profiles"
@@ -191,13 +192,14 @@ func run(args []string) error {
 		Route:       c.Route,
 		ClockOffset: c.ClockOffset,
 		Runner: runner.Runner{
-			Version:     version,
-			Survey:      func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
-			Profiles:    profiles.Runner{},
-			PlatformURL: c.BaseURL,
-			Runtime:     runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")},
-			Updater:     update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
-			Restart:     restart,
+			Version:      version,
+			Survey:       func(ctx context.Context) survey.Report { return survey.Collect(ctx, survey.Real()) },
+			Profiles:     profiles.Runner{},
+			PlatformURL:  c.BaseURL,
+			Runtime:      runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")},
+			ControlPlane: controlplane.Provisioner{Source: c, PlatformURL: c.BaseURL},
+			Updater:      update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
+			Restart:      restart,
 		},
 		Guard:   update.Guard{ExePath: exe, Version: version, State: st},
 		Restart: stop, // the service manager starts the agent again; the new binary is what runs

@@ -1228,3 +1228,153 @@ f_ncs_resolvers_do() {
   { echo "# Written by nuit-cloud (the ncs_resolvers feature): kept first when dhcpcd writes resolv.conf again."; echo "$names"; } >"$f.head" || return 1
   echo "  resolvers set to: $(resolver_words | tr '\n' ' ')"
 }
+
+# ─── Services a control-plane host runs for the platform (the nuit-cloud-control-plane profile; docs/control-plane/control-plane-services.md) ───
+# The scheduler (Ofelia and the sweep scripts), the agent's https front (nginx forwarding only /api/agent/) and a dyndns probe, each a
+# container run by its own systemd unit, so they start at boot with no platform. The signed task names the services and each image pinned by
+# DIGEST (NCS_CP_SERVICES, NCS_CP_IMAGE_<SERVICE>); the agent has already written the secrets to root-only files under NCS_CP_CONFIG_DIR
+# (scheduler.env, probe.env, tls/cert.pem, tls/key.pem) and a `revision` file, and says only where they are (NCS_CP_CONFIG_DIR), which revision
+# it fetched (NCS_CP_REVISION) and the NAMES of secrets the platform did not have (NCS_CP_MISSING). Nothing here reads those files out loud: a
+# feature never prints, copies or passes on the content of an env file or a key, only mounts them read-only into the container.
+# `applied-<service>` (the revision the unit was last started under) is how a changed configuration is told from an unchanged one.
+cp_dir() { printf '%s' "${NCS_CP_CONFIG_DIR:-/etc/nuit-cloud/control-plane}"; }
+cp_unit_file() { p "/etc/systemd/system/nuit-cloud-cp-$1.service"; }
+cp_wants() { case " ${NCS_CP_SERVICES:-} " in *" $1 "*) return 0 ;; esac; return 1; }
+cp_image() {
+  case "$1" in
+    scheduler) printf '%s' "${NCS_CP_IMAGE_SCHEDULER:-}" ;;
+    tls-front) printf '%s' "${NCS_CP_IMAGE_TLS_FRONT:-}" ;;
+    probe) printf '%s' "${NCS_CP_IMAGE_PROBE:-}" ;;
+  esac
+}
+cp_image_valid() { cp_image "$1" | grep -Eq '^[a-z0-9][a-z0-9._/-]{0,199}@sha256:[0-9a-f]{64}$'; }
+cp_secret_name() {
+  case "$1" in
+    scheduler) echo control-plane/scheduler ;;
+    tls-front) echo control-plane/agent-tls ;;
+    probe) echo control-plane/probe ;;
+  esac
+}
+cp_is_missing() { case " ${NCS_CP_MISSING:-} " in *" $(cp_secret_name "$1") "*) return 0 ;; esac; return 1; }
+cp_revision_on_disk() { cat "$(cp_dir)/revision" 2>/dev/null || true; }
+
+# The https front's nginx configuration (not secret): the same as deploy/agent-tls/nginx.conf, with the platform's address filled in.
+cp_nginx_conf() {
+  cat <<CONF
+# Written by nuit-cloud (the ncs_cp_tls_front feature). Forwards ONLY /api/agent/ to the platform; everything else is 404.
+server {
+  listen 8443 ssl;
+  server_name agent.ops.nuitcloud.com;
+  ssl_certificate     /tls/fullchain.pem;
+  ssl_certificate_key /tls/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  client_max_body_size 1m;
+  location /api/agent/ {
+    proxy_pass http://$NCS_CP_TLS_UPSTREAM;
+    proxy_set_header Host agent.ops.nuitcloud.com;
+    proxy_set_header X-Forwarded-For \$remote_addr;
+    proxy_read_timeout 60s;
+  }
+  location / { return 404; }
+}
+CONF
+}
+
+# The systemd unit for one service, on stdout. Every container: read-only root, no capabilities (the https front adds back the three nginx needs
+# to start its workers), no new privileges, a tmpfs /tmp, a memory limit for a 1 GB machine and a process cap, started by DIGEST.
+cp_render() { # cp_render <service>
+  svc="$1"; img="$(cp_image "$svc")"; dir="$(cp_dir)"; name="ncs-cp-$svc"
+  case "$svc" in
+    scheduler) mem=128m; pids=64; extra="--env-file $dir/scheduler.env" ;;
+    probe) mem=64m; pids=32; extra="--env-file $dir/probe.env -v ncs-cp-probe-data:/data" ;;
+    tls-front) mem=64m; pids=64
+      extra="--network host --cap-add CHOWN --cap-add SETUID --cap-add SETGID --tmpfs /var/cache/nginx --tmpfs /run -v $dir/tls/cert.pem:/tls/fullchain.pem:ro -v $dir/tls/key.pem:/tls/privkey.pem:ro -v $dir/tls/nginx.conf:/etc/nginx/conf.d/default.conf:ro" ;;
+  esac
+  cat <<UNIT
+# Written by nuit-cloud (the ncs_cp_$(printf '%s' "$svc" | tr - _) feature). Starts at boot, with no platform.
+[Unit]
+Description=Nuit Cloud control plane: $svc
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Restart=always
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f $name
+ExecStart=/usr/bin/docker run --rm --name $name --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=16m --memory $mem --memory-swap $mem --pids-limit $pids $extra $img
+ExecStop=/usr/bin/docker stop $name
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# The files the agent wrote for a service are there (their content is the agent's, never read here).
+cp_files_present() {
+  dir="$(cp_dir)"
+  case "$1" in
+    scheduler) [ -s "$dir/scheduler.env" ] ;;
+    probe) [ -s "$dir/probe.env" ] ;;
+    tls-front) [ -s "$dir/tls/cert.pem" ] && [ -s "$dir/tls/key.pem" ] ;;
+  esac
+}
+cp_running_image() { docker inspect --format '{{.Config.Image}}' "ncs-cp-$1" 2>/dev/null || true; }
+cp_nginx_ok() { [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] && cp_nginx_conf | cmp -s - "$(cp_dir)/tls/nginx.conf"; }
+
+cp_ok() { # cp_ok <service>
+  svc="$1"
+  cp_wants "$svc" || return 0
+  cp_image_valid "$svc" || return 1
+  if cp_is_missing "$svc"; then return 1; fi
+  [ -n "${NCS_CP_REVISION:-}" ] && [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] || return 1
+  cp_files_present "$svc" || return 1
+  if [ "$svc" = tls-front ]; then cp_nginx_ok || return 1; fi
+  cp_render "$svc" | cmp -s - "$(cp_unit_file "$svc")" || return 1
+  systemctl is-active --quiet "nuit-cloud-cp-$svc.service" || return 1
+  [ "$(cp_running_image "$svc")" = "$(cp_image "$svc")" ] || return 1
+  [ "$(cat "$(cp_dir)/applied-$svc" 2>/dev/null || true)" = "$NCS_CP_REVISION" ]
+}
+
+cp_do() { # cp_do <service>
+  svc="$1"; unit="nuit-cloud-cp-$svc.service"; dir="$(cp_dir)"; changed=0
+  cp_wants "$svc" || return 0
+  cp_image_valid "$svc" || { echo "  the task carries no image pinned by digest for $svc" >&2; return 3; }
+  if cp_is_missing "$svc"; then
+    echo "  the platform has no usable secret for $svc yet ($(cp_secret_name "$svc")): put it there, then apply this again" >&2
+    return 3
+  fi
+  [ -n "${NCS_CP_REVISION:-}" ] || { echo "  the task carries no configuration revision" >&2; return 3; }
+  [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] && cp_files_present "$svc" || { echo "  the configuration files for $svc are not written (the agent writes them when it applies)" >&2; return 1; }
+  command -v docker >/dev/null 2>&1 || { echo "  the container engine is not installed" >&2; return 1; }
+  if [ "$svc" = tls-front ]; then
+    [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] || { echo "  the platform has not said where the https front forwards /api/agent/ to (tlsFront.upstream)" >&2; return 3; }
+    if ! cp_nginx_ok; then
+      cp_nginx_conf >"$dir/tls/nginx.conf.nuit-new" && chmod 644 "$dir/tls/nginx.conf.nuit-new" && mv "$dir/tls/nginx.conf.nuit-new" "$dir/tls/nginx.conf" || return 1
+      changed=1
+    fi
+  fi
+  img="$(cp_image "$svc")"
+  docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null || { echo "  could not pull $img (can this machine reach its registry?)" >&2; return 1; }
+  uf="$(cp_unit_file "$svc")"; mkdir -p "$(dirname "$uf")"
+  cp_render "$svc" >"$uf.nuit-new" || return 1
+  if [ -f "$uf" ] && cmp -s "$uf.nuit-new" "$uf"; then rm -f "$uf.nuit-new"; else chmod 644 "$uf.nuit-new" && mv "$uf.nuit-new" "$uf" || return 1; changed=1; fi
+  if [ "$changed" = 1 ]; then systemctl daemon-reload || return 1; fi
+  systemctl enable "$unit" >/dev/null 2>&1 || return 1
+  if [ "$changed" = 1 ] || [ "$(cat "$dir/applied-$svc" 2>/dev/null || true)" != "$NCS_CP_REVISION" ] || ! systemctl is-active --quiet "$unit" || [ "$(cp_running_image "$svc")" != "$img" ]; then
+    systemctl restart "$unit" || return 1
+  fi
+  n=0
+  while [ "$n" -lt "${NCS_CP_START_WAIT_SECONDS:-30}" ]; do
+    systemctl is-active --quiet "$unit" && [ "$(cp_running_image "$svc")" = "$img" ] && break
+    n=$((n + 1)); sleep 1
+  done
+  printf '%s\n' "$NCS_CP_REVISION" >"$dir/applied-$svc" || return 1
+  echo "  $svc runs from $img (unit $unit, enabled at boot)"
+}
+
+f_ncs_cp_scheduler_ok() { cp_ok scheduler; }
+f_ncs_cp_scheduler_do() { cp_do scheduler; }
+f_ncs_cp_tls_front_ok() { cp_ok tls-front; }
+f_ncs_cp_tls_front_do() { cp_do tls-front; }
+f_ncs_cp_probe_ok() { cp_ok probe; }
+f_ncs_cp_probe_do() { cp_do probe; }
