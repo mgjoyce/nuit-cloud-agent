@@ -1229,7 +1229,7 @@ f_ncs_resolvers_do() {
   echo "  resolvers set to: $(resolver_words | tr '\n' ' ')"
 }
 
-# ─── Services a control-plane host runs for the platform (the nuit-cloud-control-plane profile; docs/control-plane/control-plane-services.md) ───
+# ─── Services a Control Plane Server runs for the platform (the nuit-cloud-control-plane profile; docs/control-plane/control-plane-services.md) ───
 # The scheduler (Ofelia and the sweep scripts), the agent's https front (Debian's nginx forwarding only /api/agent/) and a dyndns probe, each
 # a NATIVE systemd service (no container engine) that starts at boot with no platform. The signed task names the services and the bundle
 # (NCS_CP_BUNDLE_VERSION, NCS_CP_BUNDLE_SHA256) that holds Ofelia, the scheduler's scripts and configuration and the probe's script; the AGENT has
