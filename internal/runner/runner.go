@@ -61,7 +61,7 @@ type Runner struct {
 	// Repair asks the container runtime about, or ends, supervisors that serve no container (action "list" or "end"); injectable for tests.
 	Repair func(ctx context.Context, action string) (string, int, error)
 	// SetHostname changes the machine's hostname (hostname.Setter; injectable so tests touch no real machine).
-	SetHostname func(ctx context.Context, name string) (hostname.Result, error)
+	SetHostname func(ctx context.Context, name, address string) (hostname.Result, error)
 	// Restart is set when a task has changed the agent itself (an update), so the loop restarts it after reporting.
 	Restart *atomic.Bool
 	Now     func() time.Time
@@ -353,10 +353,11 @@ func (r Runner) repair(ctx context.Context, task *taskverify.Task) client.Report
 	return client.Report{Status: status, ExitCode: &exit, Output: profiles.Truncate(out, 32*1024), Result: res}
 }
 
-// setHostname re-validates the platform's parameter (one DNS label, nothing else) and changes the hostname.
+// setHostname re-validates the platform's parameters (one DNS label, an optional unicast IPv4 address, nothing else) and
+// changes the hostname.
 func (r Runner) setHostname(ctx context.Context, task *taskverify.Task) client.Report {
 	one := 1
-	name, err := hostname.Validate(task.Params)
+	name, address, err := hostname.Validate(task.Params)
 	if err != nil {
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
@@ -364,13 +365,13 @@ func (r Runner) setHostname(ctx context.Context, task *taskverify.Task) client.R
 	if set == nil {
 		set = hostname.Setter{}.Set
 	}
-	res, err := set(ctx, name)
+	res, err := set(ctx, name, address)
 	if err != nil {
 		return client.Report{Status: "failed", ExitCode: &one, Output: err.Error()}
 	}
 	zero := 0
 	return client.Report{Status: "done", ExitCode: &zero, Output: fmt.Sprintf("hostname %s: %s (was %s, by %s)", res.Hostname, res.Outcome, res.Previous, res.Method),
-		Result: map[string]any{"previous": res.Previous, "hostname": res.Hostname, "outcome": res.Outcome, "method": res.Method}}
+		Result: map[string]any{"previous": res.Previous, "hostname": res.Hostname, "outcome": res.Outcome, "method": res.Method, "address": res.Address, "hostsLine": res.HostsLine}}
 }
 
 // smoke runs the runtime's smoke test. It passes only if the script says so (SMOKE OK) and exits 0.

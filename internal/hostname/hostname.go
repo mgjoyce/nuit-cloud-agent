@@ -1,11 +1,13 @@
-// Package hostname implements the set-hostname task: it changes the machine's hostname, /etc/hostname and the 127.0.1.1
-// line of /etc/hosts, and nothing else. Commands and file locations are injectable so tests touch no real machine.
+// Package hostname implements the set-hostname task: it changes the machine's hostname, /etc/hostname and the one line of
+// /etc/hosts that names this machine, and nothing else. Commands and file locations are injectable so tests touch no real
+// machine.
 package hostname
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,23 +19,49 @@ import (
 // label is the platform's own rule (catalog.ts HOSTNAME_LABEL): one DNS label, no dots, no leading or trailing dash, 1-63.
 var label = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// Validate re-checks what the platform signed: exactly one key, hostname, a string; it is trimmed and lower-cased and must be
-// one DNS label. It returns the normalised name.
-func Validate(params map[string]any) (string, error) {
+// dotted is a strictly dotted IPv4 address (no leading zeros).
+var dotted = regexp.MustCompile(`^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$`)
+
+// Marker is the comment that makes a line of /etc/hosts this agent's own.
+const Marker = "# nuit-cloud"
+
+// Validate re-checks what the platform signed: the keys hostname (required) and address (optional) and no others. The
+// hostname is trimmed and lower-cased and must be one DNS label; the address must be a dotted IPv4 that is not 0.0.0.0,
+// loopback, link-local or multicast and above. It returns the normalised name and the address ("" when none was given).
+func Validate(params map[string]any) (string, string, error) {
 	for k := range params {
-		if k != "hostname" {
-			return "", errors.New("set-hostname takes only a hostname")
+		if k != "hostname" && k != "address" {
+			return "", "", errors.New("set-hostname takes only a hostname and an address")
 		}
 	}
 	raw, ok := params["hostname"].(string)
 	if !ok {
-		return "", errors.New("set-hostname needs a hostname (a string)")
+		return "", "", errors.New("set-hostname needs a hostname (a string)")
 	}
 	name := strings.ToLower(strings.TrimSpace(raw))
 	if !label.MatchString(name) {
-		return "", errors.New("hostname must be one DNS label: 1 to 63 lower-case letters, digits and dashes, not starting or ending with a dash")
+		return "", "", errors.New("hostname must be one DNS label: 1 to 63 lower-case letters, digits and dashes, not starting or ending with a dash")
 	}
-	return name, nil
+	rawAddr, has := params["address"]
+	if !has {
+		return name, "", nil
+	}
+	address, ok := rawAddr.(string)
+	if !ok || !usableAddress(address) {
+		return "", "", errors.New("address must be a unicast IPv4 address (not 0.0.0.0, loopback, link-local or multicast)")
+	}
+	return name, address, nil
+}
+
+func usableAddress(a string) bool {
+	if !dotted.MatchString(a) {
+		return false
+	}
+	ip := net.ParseIP(a).To4()
+	if ip == nil || ip.IsUnspecified() || ip[0] == 127 || (ip[0] == 169 && ip[1] == 254) || ip[0] >= 224 {
+		return false
+	}
+	return true
 }
 
 // Result is what the task reports. Nothing in it is secret.
@@ -42,8 +70,12 @@ type Result struct {
 	Hostname string `json:"hostname"`
 	// Outcome is "changed" or "unchanged".
 	Outcome string `json:"outcome"`
-	// Method is "hostnamectl", "hostname-file" (the fallback) or "none" when nothing was changed.
+	// Method is "hostnamectl", "hostname-file" (the fallback), "hosts-only" (the name was already right) or "none".
 	Method string `json:"method"`
+	// Address is the address /etc/hosts maps the name to, or "" when it maps to loopback.
+	Address string `json:"address"`
+	// HostsLine is "address" or "loopback".
+	HostsLine string `json:"hostsLine"`
 }
 
 // Setter does the work.
@@ -73,11 +105,15 @@ func (s Setter) paths() (string, string) {
 	return h, hosts
 }
 
-// Set makes name the machine's hostname. It is idempotent: when the running hostname, /etc/hostname and /etc/hosts already
-// say it, nothing is written and no command that changes anything is run.
-func (s Setter) Set(ctx context.Context, name string) (Result, error) {
+// Set makes name the machine's hostname, with /etc/hosts mapping it to address (or to 127.0.1.1 when address is empty). It
+// is idempotent: when the running hostname, /etc/hostname and /etc/hosts are already exactly as this would leave them, nothing
+// is written and no command that changes anything is run. When only the address differs, only /etc/hosts is rewritten.
+func (s Setter) Set(ctx context.Context, name, address string) (Result, error) {
 	if !label.MatchString(name) {
 		return Result{}, errors.New("not a valid hostname")
+	}
+	if address != "" && !usableAddress(address) {
+		return Result{}, errors.New("not a usable address")
 	}
 	hostnamePath, hostsPath := s.paths()
 
@@ -98,20 +134,29 @@ func (s Setter) Set(ctx context.Context, name string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	newHosts := RewriteHosts(hosts, name, running, fileName)
+	newHosts := RewriteHosts(hosts, name, address, running, fileName)
+	line := "loopback"
+	if address != "" {
+		line = "address"
+	}
+	res := Result{Previous: previous, Hostname: name, Outcome: "changed", Method: "hosts-only", Address: address, HostsLine: line}
 
-	if running == name && fileName == name && newHosts == hosts {
-		return Result{Previous: previous, Hostname: name, Outcome: "unchanged", Method: "none"}, nil
+	nameRight := running == name && fileName == name
+	if nameRight && newHosts == hosts {
+		res.Outcome, res.Method = "unchanged", "none"
+		return res, nil
 	}
 
-	method := "hostnamectl"
-	if _, ctlErr := s.run(ctx, "hostnamectl", "set-hostname", name); ctlErr != nil {
-		method = "hostname-file"
-		if err := writeAtomic(hostnamePath, []byte(name+"\n"), 0o644, nil); err != nil {
-			return Result{}, fmt.Errorf("hostnamectl failed (%v) and %s could not be written: %w", ctlErr, hostnamePath, err)
-		}
-		if out, err := s.run(ctx, "hostname", name); err != nil {
-			return Result{}, fmt.Errorf("hostnamectl failed (%v) and `hostname` failed too: %v %s", ctlErr, err, strings.TrimSpace(out))
+	if !nameRight {
+		res.Method = "hostnamectl"
+		if _, ctlErr := s.run(ctx, "hostnamectl", "set-hostname", name); ctlErr != nil {
+			res.Method = "hostname-file"
+			if err := writeAtomic(hostnamePath, []byte(name+"\n"), 0o644, nil); err != nil {
+				return Result{}, fmt.Errorf("hostnamectl failed (%v) and %s could not be written: %w", ctlErr, hostnamePath, err)
+			}
+			if out, err := s.run(ctx, "hostname", name); err != nil {
+				return Result{}, fmt.Errorf("hostnamectl failed (%v) and `hostname` failed too: %v %s", ctlErr, err, strings.TrimSpace(out))
+			}
 		}
 	}
 	if newHosts != hosts {
@@ -119,7 +164,7 @@ func (s Setter) Set(ctx context.Context, name string) (Result, error) {
 			return Result{}, fmt.Errorf("the hostname is now %s but %s could not be updated: %w", name, hostsPath, err)
 		}
 	}
-	return Result{Previous: previous, Hostname: name, Outcome: "changed", Method: method}, nil
+	return res, nil
 }
 
 type owner struct{ uid, gid int }
@@ -143,44 +188,84 @@ func readHosts(path string) (string, os.FileMode, *owner, error) {
 	return string(b), st.Mode().Perm(), o, nil
 }
 
-// RewriteHosts returns hosts with the first 127.0.1.1 line pointing at name (aliases other than the old hostnames kept, any
-// trailing comment kept), or with `127.0.1.1<TAB>name` appended when there is none. Every other line is returned unchanged.
-func RewriteHosts(hosts, name string, olds ...string) string {
+type hostsLine struct {
+	indent, addr, sep string // leading space, first field, whitespace after it
+	fields            []string
+	comment, eol      string
+}
+
+func parseLine(line string) (hostsLine, bool) {
+	body := strings.TrimRight(line, "\n")
+	l := hostsLine{eol: line[len(body):]}
+	code := body
+	if at := strings.Index(body, "#"); at >= 0 {
+		code, l.comment = body[:at], body[at:]
+	}
+	l.fields = strings.Fields(code)
+	if len(l.fields) == 0 {
+		return l, false
+	}
+	l.addr = l.fields[0]
+	start := strings.Index(code, l.addr)
+	l.indent = code[:start]
+	rest := code[start+len(l.addr):]
+	l.sep = rest[:len(rest)-len(strings.TrimLeft(rest, " \t"))]
+	return l, true
+}
+
+// RewriteHosts changes at most one line of hosts so that it maps name (aliases other than the old hostnames kept). The line
+// changed is this agent's own (an address, comment exactly "# nuit-cloud") if there is one, else the first `127.0.1.1` line,
+// else one is appended.
+//
+// With an address the line becomes `<address> <name> [aliases] # nuit-cloud` (appended: `<address><TAB><name><TAB># nuit-cloud`).
+// Without one it becomes `127.0.1.1 <name> [aliases]`, without the marker (appended: `127.0.1.1<TAB><name>`).
+//
+// Indentation and the spacing after the address are kept. A trailing comment on a rewritten line is replaced (by the marker,
+// or by nothing), since the marker is the whole comment that identifies the line. Every other line is returned unchanged.
+func RewriteHosts(hosts, name, address string, olds ...string) string {
 	lines := strings.SplitAfter(hosts, "\n")
-	for i, line := range lines {
-		body := strings.TrimRight(line, "\n")
-		eol := line[len(body):]
-		code, comment := body, ""
-		if at := strings.Index(body, "#"); at >= 0 {
-			code, comment = body[:at], body[at:]
-		}
-		fields := strings.Fields(code)
-		if len(fields) == 0 || fields[0] != "127.0.1.1" {
+	ours, loop := -1, -1
+	for i, raw := range lines {
+		l, ok := parseLine(raw)
+		if !ok {
 			continue
 		}
+		if ours < 0 && net.ParseIP(l.addr) != nil && strings.TrimSpace(l.comment) == Marker {
+			ours = i
+		}
+		if loop < 0 && l.addr == "127.0.1.1" {
+			loop = i
+		}
+	}
+	target := ours
+	if target < 0 {
+		target = loop
+	}
+	if target >= 0 {
+		l, _ := parseLine(lines[target])
 		names := []string{name}
-		for _, a := range fields[1:] {
+		for _, a := range l.fields[1:] {
 			if a == name || contains(olds, a) {
 				continue
 			}
 			names = append(names, a)
 		}
-		// keep the original indentation and the spacing after the address
-		start := strings.Index(code, "127.0.1.1")
-		sep := "\t"
-		rest := code[start+len("127.0.1.1"):]
-		if ws := rest[:len(rest)-len(strings.TrimLeft(rest, " \t"))]; ws != "" {
-			sep = ws
+		sep := l.sep
+		if sep == "" {
+			sep = "\t"
 		}
-		out := code[:start] + "127.0.1.1" + sep + strings.Join(names, " ")
-		if comment != "" {
-			out += " " + comment
+		addr, comment := "127.0.1.1", ""
+		if address != "" {
+			addr, comment = address, " "+Marker
 		}
-		lines[i] = out + eol
+		lines[target] = l.indent + addr + sep + strings.Join(names, " ") + comment + l.eol
 		return strings.Join(lines, "")
 	}
 	if hosts != "" && !strings.HasSuffix(hosts, "\n") {
 		hosts += "\n"
+	}
+	if address != "" {
+		return hosts + address + "\t" + name + "\t" + Marker + "\n"
 	}
 	return hosts + "127.0.1.1\t" + name + "\n"
 }

@@ -507,9 +507,9 @@ func TestRuntimeRepairOnlyAsksTheRuntimeToListOrEnd(t *testing.T) {
 func TestSetHostnameValidatesAgainAndOnlyThenChangesAnything(t *testing.T) {
 	r := newRunner()
 	var asked []string
-	r.SetHostname = func(_ context.Context, name string) (hostname.Result, error) {
-		asked = append(asked, name)
-		return hostname.Result{Previous: "old", Hostname: name, Outcome: "changed", Method: "hostnamectl"}, nil
+	r.SetHostname = func(_ context.Context, name, address string) (hostname.Result, error) {
+		asked = append(asked, name+"@"+address)
+		return hostname.Result{Previous: "old", Hostname: name, Outcome: "changed", Method: "hostnamectl", Address: address, HostsLine: "address"}, nil
 	}
 	task := func(p map[string]any) *taskverify.Task {
 		return &taskverify.Task{Name: "set-hostname", TimeoutSeconds: 60, Params: p}
@@ -519,15 +519,23 @@ func TestSetHostnameValidatesAgainAndOnlyThenChangesAnything(t *testing.T) {
 	if rep.Status != "done" || res["hostname"] != "box-2" || res["previous"] != "old" || res["outcome"] != "changed" || res["method"] != "hostnamectl" {
 		t.Errorf("%+v", rep)
 	}
-	for _, bad := range []map[string]any{{}, {"hostname": "a.b"}, {"hostname": "-a"}, {"hostname": "a", "x": 1}, {"hostname": 3}} {
+	rep = r.Run(context.Background(), task(map[string]any{"hostname": "box-3", "address": "10.10.10.170"}))
+	res, _ = rep.Result.(map[string]any)
+	if rep.Status != "done" || res["address"] != "10.10.10.170" || res["hostsLine"] != "address" {
+		t.Errorf("%+v", rep)
+	}
+	for _, bad := range []map[string]any{{}, {"hostname": "a.b"}, {"hostname": "-a"}, {"hostname": "a", "x": 1}, {"hostname": 3},
+		{"hostname": "a", "address": "127.0.0.1"}, {"hostname": "a", "address": "10.0.0.1; rm"}, {"hostname": "a", "address": 5}} {
 		if rep := r.Run(context.Background(), task(bad)); rep.Status != "failed" {
 			t.Errorf("%v was accepted: %+v", bad, rep)
 		}
 	}
-	if len(asked) != 1 || asked[0] != "box-2" {
+	if len(asked) != 2 || asked[0] != "box-2@" || asked[1] != "box-3@10.10.10.170" {
 		t.Errorf("the machine was asked to change to %v", asked)
 	}
-	r.SetHostname = func(context.Context, string) (hostname.Result, error) { return hostname.Result{}, errors.New("no") }
+	r.SetHostname = func(context.Context, string, string) (hostname.Result, error) {
+		return hostname.Result{}, errors.New("no")
+	}
 	if rep := r.Run(context.Background(), task(map[string]any{"hostname": "box"})); rep.Status != "failed" {
 		t.Errorf("%+v", rep)
 	}
