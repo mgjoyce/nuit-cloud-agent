@@ -1450,8 +1450,8 @@ cp_bundle_service_do() { # same arguments
   echo "  $svc runs from bundle $NCS_CP_BUNDLE_VERSION (unit $unit, enabled at boot)"
 }
 
-f_ncs_cp_scheduler_ok() { cp_bundle_service_ok scheduler ncs-scheduler cp_render_scheduler scheduler.env curl wget ca-certificates; }
-f_ncs_cp_scheduler_do() { cp_bundle_service_do scheduler ncs-scheduler cp_render_scheduler scheduler.env curl wget ca-certificates; }
+f_ncs_cp_scheduler_ok() { cp_bundle_service_ok scheduler ncs-scheduler cp_render_scheduler scheduler.env curl ca-certificates; }
+f_ncs_cp_scheduler_do() { cp_bundle_service_do scheduler ncs-scheduler cp_render_scheduler scheduler.env curl ca-certificates; }
 f_ncs_cp_probe_ok() { cp_bundle_service_ok probe ncs-probe cp_render_probe probe.env curl ca-certificates; }
 f_ncs_cp_probe_do() { cp_bundle_service_do probe ncs-probe cp_render_probe probe.env curl ca-certificates; }
 
