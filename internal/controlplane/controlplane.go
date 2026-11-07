@@ -1,11 +1,13 @@
 // Package controlplane is the agent's half of the `nuit-cloud-control-plane` profile: what a control-plane host runs for the platform
-// (the scheduler, the agent's https front, a dyndns probe) as containers started by systemd at boot, with no platform needed.
+// (the scheduler, the agent's https front, a dyndns probe) as native services started by systemd at boot, with no platform needed and no
+// container engine.
 //
-// The signed task names the services and each container image pinned by digest, and nothing secret. The secrets (the scheduler's
-// tokens, the https front's key, the probe's tokens) come from a second, authenticated read of the platform
-// (`GET /api/agent/control-plane-config`) and are written HERE, by the agent, to root-only files. The shell features of the profile
-// (deploy/bootstrap, `ncs_cp_*`) only ever see the file locations and non-secret facts, as environment; no secret is ever passed to a
-// child process, put in a command line, logged or reported.
+// The signed task names the services and the bundle (version, architecture, SHA-256) that holds the scheduler's program and scripts and
+// the probe's script, and nothing secret. The bundle is downloaded, checked against the signed checksum and unpacked here, by a hardened
+// extractor (bundle.go). The secrets (the scheduler's tokens, the https front's key, the probe's tokens) come from a second, authenticated
+// read of the platform (`GET /api/agent/control-plane-config`) and are written HERE, by the agent, to root-only files. The shell features
+// of the profile (deploy/bootstrap, `ncs_cp_*`) install and run what was unpacked; they are only ever told where things are and non-secret
+// facts, as environment. No secret is ever passed to a child process, put in a command line, logged or reported.
 package controlplane
 
 import (
@@ -17,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,21 +46,31 @@ const ConfigPath = "/api/agent/control-plane-config"
 // MaxConfigBytes bounds what is read from the platform.
 const MaxConfigBytes = 256 << 10
 
-var imageByDigest = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,199}@sha256:[0-9a-f]{64}$`)
+// hostArch is this machine's architecture as the platform names it; a variable so tests can stand in for another machine.
+var hostArch = func() string { return runtime.GOARCH }
 
-// Params are what a signed task carries: which services, and each one's image pinned by digest. Nothing secret.
+// Params are what a signed task carries: which services, and the bundle they run from. Nothing secret.
 type Params struct {
 	Services []string
-	Images   map[string]string
+	Bundle   Bundle
 }
 
-// ParseParams checks the `controlPlane` parameter exactly as the platform's own validator does: only `services` and `images`; services
-// a non-empty, unique subset of the closed list; an image for each listed service, by digest (a tag is refused), and none for a
-// service that is not listed.
+// NeedsBundle says whether any requested service runs from the bundle (the https front is Debian's own nginx).
+func (p Params) NeedsBundle() bool {
+	for _, s := range p.Services {
+		if s == "scheduler" || s == "probe" {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseParams checks the `controlPlane` parameter exactly as the platform does: only `services` and `bundle`; services a non-empty,
+// unique subset of the closed list; the bundle with exactly version, arch (amd64 or arm64, and this machine's own) and sha256.
 func ParseParams(raw map[string]any) (Params, error) {
 	for k := range raw {
-		if k != "services" && k != "images" {
-			return Params{}, errors.New("controlPlane may only carry services and images")
+		if k != "services" && k != "bundle" {
+			return Params{}, errors.New("controlPlane may only carry services and bundle")
 		}
 	}
 	list, ok := raw["services"].([]any)
@@ -72,25 +85,32 @@ func ParseParams(raw map[string]any) (Params, error) {
 		}
 		wanted[s] = true
 	}
-	images, ok := raw["images"].(map[string]any)
+	b, ok := raw["bundle"].(map[string]any)
 	if !ok {
-		return Params{}, errors.New("images must give an image for each service")
+		return Params{}, errors.New("bundle must give the version, arch and sha256 of the control-plane bundle")
 	}
-	p := Params{Images: map[string]string{}}
+	for k := range b {
+		if k != "version" && k != "arch" && k != "sha256" {
+			return Params{}, errors.New("bundle may only carry version, arch and sha256")
+		}
+	}
+	str := func(k string) string { s, _ := b[k].(string); return s }
+	p := Params{Bundle: Bundle{Version: str("version"), Arch: str("arch"), SHA256: str("sha256")}}
+	if !versionRe.MatchString(p.Bundle.Version) {
+		return Params{}, errors.New("the bundle's version is not usable")
+	}
+	if p.Bundle.Arch != "amd64" && p.Bundle.Arch != "arm64" {
+		return Params{}, errors.New("the bundle's arch must be amd64 or arm64")
+	}
+	if p.Bundle.Arch != hostArch() {
+		return Params{}, fmt.Errorf("the bundle is for %s and this machine is %s", p.Bundle.Arch, hostArch())
+	}
+	if !hexSHA256.MatchString(p.Bundle.SHA256) {
+		return Params{}, errors.New("the bundle's sha256 is not a SHA-256")
+	}
 	for _, s := range Services { // the canonical order, whatever order the task listed them in
-		if !wanted[s] {
-			continue
-		}
-		ref, ok := images[s].(string)
-		if !ok || !imageByDigest.MatchString(ref) {
-			return Params{}, fmt.Errorf("the image for %s must be pinned by digest (name@sha256:<64 hex>), never by a tag", s)
-		}
-		p.Services = append(p.Services, s)
-		p.Images[s] = ref
-	}
-	for k := range images {
-		if !wanted[k] {
-			return Params{}, errors.New("images names a service that is not in services")
+		if wanted[s] {
+			p.Services = append(p.Services, s)
 		}
 	}
 	return p, nil
@@ -249,24 +269,31 @@ func contains(l []string, s string) bool {
 	return false
 }
 
-// parseEnv re-checks the scheduler's environment. `docker --env-file` does no unquoting and has no way to hold a newline, so a value that
-// would not survive it is refused (by name only), never quoted into something else.
+// parseEnv re-checks the scheduler's environment. The values are written quoted (see QuoteEnv), which can hold anything but a control
+// character or a newline: such a value is refused, by variable name only.
 func parseEnv(raw map[string]any) (map[string]string, error) {
 	if len(raw) == 0 || len(raw) > maxEnvVars {
 		return nil, errors.New("the scheduler's environment from the platform is empty or too large")
 	}
 	out := map[string]string{}
 	for name, v := range raw {
-		s, ok := v.(string)
-		if !envName.MatchString(name) || !ok || s == "" || len(s) > maxEnvValue || s != strings.TrimSpace(s) || strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-			if envName.MatchString(name) {
-				return nil, fmt.Errorf("the scheduler's variable %s cannot be written to an env file (empty, padded with spaces, or holding a control character)", name)
-			}
+		if !envName.MatchString(name) {
 			return nil, errors.New("the scheduler's environment from the platform has a variable with a name that is not allowed")
+		}
+		s, ok := v.(string)
+		if !ok || len(s) > maxEnvValue || strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			return nil, fmt.Errorf("the scheduler's variable %s cannot be written to an environment file (not text, too long, or holding a control character)", name)
 		}
 		out[name] = s
 	}
 	return out, nil
+}
+
+// QuoteEnv writes one line of an environment file for systemd's EnvironmentFile=: NAME="value", with backslash and double quote
+// escaped. systemd expands neither `$` nor `%` there, so they stand for themselves, and a trailing backslash is escaped like any other.
+func QuoteEnv(name, value string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	return name + `="` + r.Replace(value) + `"` + "\n"
 }
 
 func validUpstream(s string) bool {
@@ -285,8 +312,14 @@ func validUpstream(s string) bool {
 // Provisioner prepares a control-plane host for the profile's scripts.
 type Provisioner struct {
 	Source Source
+	// Fetcher downloads the bundle (the agent's runtime stager, so the platform's name and fallback addresses apply).
+	Fetcher Fetcher
 	// Dir holds the secrets (root-only); defaults to DefaultDir.
 	Dir string
+	// InstallDir is where each bundle version is unpacked; defaults to DefaultInstallDir.
+	InstallDir string
+	// StageDir is where a download is kept until it has been checked and unpacked (the agent's state directory).
+	StageDir string
 	// PlatformURL is the platform's address, which the probe reports to (not secret).
 	PlatformURL string
 }
@@ -298,9 +331,16 @@ func (p Provisioner) dir() string {
 	return DefaultDir
 }
 
-// Prepare reads the platform's configuration and, for an apply only, writes the files the services read (only those whose content
-// changed). It returns the non-secret environment for the scripts and a function that removes every secret value from a text (a last guard:
-// nothing the scripts print should contain one, and a result must not).
+func (p Provisioner) installDir() string {
+	if p.InstallDir != "" {
+		return p.InstallDir
+	}
+	return DefaultInstallDir
+}
+
+// Prepare reads the platform's configuration and, for an apply only, unpacks the bundle and writes the files the services read (only
+// those whose content changed). It returns the non-secret environment for the scripts and a function that removes every secret value from a
+// text (a last guard: nothing the scripts print should contain one, and a result must not).
 func (p Provisioner) Prepare(ctx context.Context, params Params, apply bool) (env []string, scrub func(string) string, err error) {
 	scrub = func(s string) string { return s }
 	if p.Source == nil {
@@ -313,6 +353,14 @@ func (p Provisioner) Prepare(ctx context.Context, params Params, apply bool) (en
 	scrub = scrubber(cfg)
 	dir := p.dir()
 	if apply {
+		if params.NeedsBundle() {
+			if p.Fetcher == nil {
+				return nil, scrub, errors.New("this agent cannot download the control-plane bundle")
+			}
+			if err := Install(ctx, p.Fetcher, params.Bundle, p.installDir(), p.StageDir); err != nil {
+				return nil, scrub, fmt.Errorf("could not install the control-plane bundle: %s", scrub(err.Error()))
+			}
+		}
 		if err := write(dir, cfg, params.Services, p.PlatformURL); err != nil {
 			return nil, scrub, fmt.Errorf("could not write the services' configuration under %s: %s", dir, scrub(err.Error()))
 		}
@@ -327,11 +375,11 @@ func (p Provisioner) Prepare(ctx context.Context, params Params, apply bool) (en
 	env = []string{
 		"NCS_CP_SERVICES=" + strings.Join(params.Services, " "),
 		"NCS_CP_CONFIG_DIR=" + dir,
+		"NCS_CP_INSTALL_DIR=" + p.installDir(),
 		"NCS_CP_REVISION=" + cfg.Revision,
 		"NCS_CP_MISSING=" + strings.Join(missing, " "),
-	}
-	for _, s := range params.Services {
-		env = append(env, "NCS_CP_IMAGE_"+strings.ToUpper(strings.ReplaceAll(s, "-", "_"))+"="+params.Images[s])
+		"NCS_CP_BUNDLE_VERSION=" + params.Bundle.Version,
+		"NCS_CP_BUNDLE_SHA256=" + params.Bundle.SHA256,
 	}
 	if cfg.TLSFront != nil && cfg.TLSFront.Upstream != "" {
 		env = append(env, "NCS_CP_TLS_UPSTREAM="+cfg.TLSFront.Upstream)
@@ -399,7 +447,7 @@ func files(c Config, wanted []string, platformURL string) []file {
 				sort.Strings(names)
 				var b strings.Builder
 				for _, n := range names {
-					b.WriteString(n + "=" + c.Scheduler.Env[n] + "\n")
+					b.WriteString(QuoteEnv(n, c.Scheduler.Env[n]))
 				}
 				out = append(out, file{"scheduler.env", 0o600, []byte(b.String())})
 			}
@@ -409,7 +457,7 @@ func files(c Config, wanted []string, platformURL string) []file {
 			}
 		case "probe":
 			if c.Probe != nil {
-				body := "NUIT_CLOUD_API_URL=" + platformURL + "\nDYNDNS_PROBE_NAME=" + c.Probe.Name + "\nDYNDNS_UPDATE_TOKEN=" + c.Probe.UpdateToken + "\nDYNDNS_BOOTSTRAP_TOKEN=" + c.Probe.BootstrapToken + "\n"
+				body := QuoteEnv("NUIT_CLOUD_API_URL", platformURL) + QuoteEnv("DYNDNS_PROBE_NAME", c.Probe.Name) + QuoteEnv("DYNDNS_UPDATE_TOKEN", c.Probe.UpdateToken) + QuoteEnv("DYNDNS_BOOTSTRAP_TOKEN", c.Probe.BootstrapToken)
 				out = append(out, file{"probe.env", 0o600, []byte(body)})
 			}
 		}
@@ -425,7 +473,7 @@ func withNewline(s string) string {
 }
 
 func write(dir string, c Config, wanted []string, platformURL string) error {
-	if strings.ContainsAny(platformURL, "\n\r\x00 ") {
+	if strings.ContainsFunc(platformURL, func(r rune) bool { return r < 0x21 || r == 0x7f }) {
 		return errors.New("the platform address is not usable")
 	}
 	for _, d := range []string{dir, filepath.Join(dir, "tls")} {

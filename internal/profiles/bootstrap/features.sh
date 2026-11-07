@@ -1230,24 +1230,20 @@ f_ncs_resolvers_do() {
 }
 
 # ─── Services a control-plane host runs for the platform (the nuit-cloud-control-plane profile; docs/control-plane/control-plane-services.md) ───
-# The scheduler (Ofelia and the sweep scripts), the agent's https front (nginx forwarding only /api/agent/) and a dyndns probe, each a
-# container run by its own systemd unit, so they start at boot with no platform. The signed task names the services and each image pinned by
-# DIGEST (NCS_CP_SERVICES, NCS_CP_IMAGE_<SERVICE>); the agent has already written the secrets to root-only files under NCS_CP_CONFIG_DIR
-# (scheduler.env, probe.env, tls/cert.pem, tls/key.pem) and a `revision` file, and says only where they are (NCS_CP_CONFIG_DIR), which revision
-# it fetched (NCS_CP_REVISION) and the NAMES of secrets the platform did not have (NCS_CP_MISSING). Nothing here reads those files out loud: a
-# feature never prints, copies or passes on the content of an env file or a key, only mounts them read-only into the container.
-# `applied-<service>` (the revision the unit was last started under) is how a changed configuration is told from an unchanged one.
+# The scheduler (Ofelia and the sweep scripts), the agent's https front (Debian's nginx forwarding only /api/agent/) and a dyndns probe, each
+# a NATIVE systemd service (no container engine) that starts at boot with no platform. The signed task names the services and the bundle
+# (NCS_CP_BUNDLE_VERSION, NCS_CP_BUNDLE_SHA256) that holds Ofelia, the scheduler's scripts and configuration and the probe's script; the AGENT has
+# already downloaded it, checked its checksum and unpacked it to <NCS_CP_INSTALL_DIR>/<version>/, and has written the secrets to root-only files
+# under NCS_CP_CONFIG_DIR (scheduler.env, probe.env, tls/cert.pem, tls/key.pem) and a `revision` file. It tells these features only where those
+# are (NCS_CP_CONFIG_DIR, NCS_CP_INSTALL_DIR), which revision it fetched (NCS_CP_REVISION) and the NAMES of secrets the platform did not have
+# (NCS_CP_MISSING). Nothing here reads those files out loud: a feature never prints or copies an env file or a key; a unit points at it with
+# EnvironmentFile= (read by systemd as root before the service drops its privileges) and nginx reads its own certificate and key.
+# `applied-<service>` (the revision and bundle a service was last started under) is how a changed configuration is told from an unchanged one.
+# `current` (a symlink to the unpacked version in use) is switched atomically; `previous` keeps the one before for rollback; older ones are deleted.
 cp_dir() { printf '%s' "${NCS_CP_CONFIG_DIR:-/etc/nuit-cloud/control-plane}"; }
+cp_install() { printf '%s' "${NCS_CP_INSTALL_DIR:-/opt/nuit-cloud/control-plane}"; }
 cp_unit_file() { p "/etc/systemd/system/nuit-cloud-cp-$1.service"; }
 cp_wants() { case " ${NCS_CP_SERVICES:-} " in *" $1 "*) return 0 ;; esac; return 1; }
-cp_image() {
-  case "$1" in
-    scheduler) printf '%s' "${NCS_CP_IMAGE_SCHEDULER:-}" ;;
-    tls-front) printf '%s' "${NCS_CP_IMAGE_TLS_FRONT:-}" ;;
-    probe) printf '%s' "${NCS_CP_IMAGE_PROBE:-}" ;;
-  esac
-}
-cp_image_valid() { cp_image "$1" | grep -Eq '^[a-z0-9][a-z0-9._/-]{0,199}@sha256:[0-9a-f]{64}$'; }
 cp_secret_name() {
   case "$1" in
     scheduler) echo control-plane/scheduler ;;
@@ -1257,16 +1253,222 @@ cp_secret_name() {
 }
 cp_is_missing() { case " ${NCS_CP_MISSING:-} " in *" $(cp_secret_name "$1") "*) return 0 ;; esac; return 1; }
 cp_revision_on_disk() { cat "$(cp_dir)/revision" 2>/dev/null || true; }
+cp_applied() { cat "$(cp_dir)/applied-$1" 2>/dev/null || true; }
+cp_marker() { # what a service was started under: the revision, and for the bundle's services the bundle too
+  if [ "$1" = tls-front ]; then printf '%s' "${NCS_CP_REVISION:-}"; else printf '%s %s' "${NCS_CP_REVISION:-}" "${NCS_CP_BUNDLE_SHA256:-}"; fi
+}
+cp_bundle_valid() {
+  printf '%s' "${NCS_CP_BUNDLE_VERSION:-}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$' && printf '%s' "${NCS_CP_BUNDLE_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$'
+}
+# `current` is the signed bundle: its VERSION and the checksum the agent recorded when it unpacked it are the task's
+cp_bundle_current() {
+  d="$(cp_install)/current"
+  [ -d "$d" ] && [ "$(cat "$d/VERSION" 2>/dev/null || true)" = "$NCS_CP_BUNDLE_VERSION" ] && [ "$(cat "$d/.bundle-sha256" 2>/dev/null || true)" = "$NCS_CP_BUNDLE_SHA256" ]
+}
+cp_bundle_unpacked() {
+  d="$(cp_install)/$NCS_CP_BUNDLE_VERSION"
+  [ -d "$d" ] && [ "$(cat "$d/.bundle-sha256" 2>/dev/null || true)" = "$NCS_CP_BUNDLE_SHA256" ] && [ "$(cat "$d/VERSION" 2>/dev/null || true)" = "$NCS_CP_BUNDLE_VERSION" ]
+}
+# cp_symlink_swap <target> <link>: point <link> at <target> atomically (a symlink made beside it, then renamed over it)
+cp_symlink_swap() {
+  rm -f "$2.nuit-new"
+  ln -s "$1" "$2.nuit-new" || return 1
+  if mv -T "$2.nuit-new" "$2" 2>/dev/null; then return 0; fi
+  mv -fh "$2.nuit-new" "$2" 2>/dev/null && return 0
+  rm -f "$2.nuit-new"; return 1
+}
+# Make `current` the signed version (keeping the one it was as `previous`) and delete every other unpacked version.
+cp_bundle_switch() {
+  inst="$(cp_install)"
+  cp_bundle_unpacked || { echo "  the bundle $NCS_CP_BUNDLE_VERSION is not unpacked under $inst (the agent does that when it applies)" >&2; return 1; }
+  old="$(readlink "$inst/current" 2>/dev/null || true)"
+  if [ "$old" != "$NCS_CP_BUNDLE_VERSION" ]; then
+    if [ -n "$old" ] && [ -d "$inst/$old" ]; then cp_symlink_swap "$old" "$inst/previous" || return 1; fi
+    cp_symlink_swap "$NCS_CP_BUNDLE_VERSION" "$inst/current" || return 1
+  fi
+  keep1="$(readlink "$inst/current" 2>/dev/null || true)"; keep2="$(readlink "$inst/previous" 2>/dev/null || true)"
+  for dd in "$inst"/*; do
+    [ -d "$dd" ] && [ ! -L "$dd" ] || continue
+    bb="$(basename "$dd")"
+    [ "$bb" = "$keep1" ] || [ "$bb" = "$keep2" ] || rm -rf "$dd"
+  done
+  return 0
+}
+cp_user_ok() { id -u "$1" >/dev/null 2>&1; }
+cp_user_make() { cp_user_ok "$1" || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$1"; }
+cp_pkgs_ok() { for pk in "$@"; do dpkg -s "$pk" >/dev/null 2>&1 || return 1; done; }
+cp_pkgs_do() { cp_pkgs_ok "$@" && return 0; net_resolves || return 3; apt-get update -qq && apt-get install -y -qq "$@"; }
+# cp_put <file> <mode>: content on stdin; replaces the file (via a temp file beside it) only if it differs; returns 10 when it did
+cp_put() {
+  cp_f="$1"; cp_mode="$2"; mkdir -p "$(dirname "$cp_f")"
+  cat >"$cp_f.nuit-new" || { rm -f "$cp_f.nuit-new"; return 1; }
+  if [ -f "$cp_f" ] && cmp -s "$cp_f.nuit-new" "$cp_f"; then rm -f "$cp_f.nuit-new"; return 0; fi
+  chmod "$cp_mode" "$cp_f.nuit-new" && mv "$cp_f.nuit-new" "$cp_f" || return 1
+  return 10
+}
 
-# The https front's nginx configuration (not secret): the same as deploy/agent-tls/nginx.conf, with the platform's address filled in.
+# What a unit must not be able to do: gain privileges, write anywhere but its own state, see home directories or devices, change the kernel,
+# or open anything but IP and local sockets. No capabilities at all.
+cp_hardening() {
+  cat <<HARD
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+HARD
+}
+
+cp_render_scheduler() {
+  cat <<UNIT
+# Written by nuit-cloud (the ncs_cp_scheduler feature). Starts at boot, with no platform.
+[Unit]
+Description=Nuit Cloud control plane: scheduler (Ofelia)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ncs-scheduler
+EnvironmentFile=$(cp_dir)/scheduler.env
+Environment=HOME=/tmp
+ExecStart=$(cp_install)/current/ofelia daemon --config /etc/ofelia/config.ini
+Restart=always
+RestartSec=10
+$(cp_hardening)
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+cp_render_probe() {
+  cat <<UNIT
+# Written by nuit-cloud (the ncs_cp_probe feature). Starts at boot, with no platform.
+[Unit]
+Description=Nuit Cloud control plane: dyndns probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ncs-probe
+EnvironmentFile=$(cp_dir)/probe.env
+StateDirectory=nuit-cloud-probe
+StateDirectoryMode=0700
+Environment=TOKEN_STATE_FILE=/var/lib/nuit-cloud-probe/update-token
+Environment=PROBE_VERSION=$NCS_CP_BUNDLE_VERSION
+Environment=HOME=/tmp
+ExecStart=/bin/sh $(cp_install)/current/probe/probe.sh
+Restart=always
+RestartSec=10
+$(cp_hardening)
+MemoryMax=64M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# The scripts and configuration of the scheduler go to /etc/ofelia, where config.ini says they are (`sh /etc/ofelia/<name>.sh`).
+cp_ofelia_etc() { p /etc/ofelia; }
+cp_ofelia_src() { printf '%s' "$(cp_install)/current/scheduler"; }
+cp_ofelia_files_ok() {
+  src="$(cp_ofelia_src)"; [ -d "$src" ] || return 1
+  for ff in "$src"/*; do [ -f "$ff" ] || continue; cmp -s "$ff" "$(cp_ofelia_etc)/$(basename "$ff")" || return 1; done
+  return 0
+}
+# returns 10 when it changed something
+cp_ofelia_files_do() {
+  src="$(cp_ofelia_src)"; changed_any=0; mkdir -p "$(cp_ofelia_etc)" && chmod 755 "$(cp_ofelia_etc)" || return 1
+  for ff in "$src"/*; do
+    [ -f "$ff" ] || continue
+    cp_rc=0; cp_put "$(cp_ofelia_etc)/$(basename "$ff")" 644 <"$ff" || cp_rc=$?
+    [ "$cp_rc" = 10 ] && changed_any=1
+    [ "$cp_rc" = 0 ] || [ "$cp_rc" = 10 ] || return 1
+  done
+  [ "$changed_any" = 1 ] && return 10
+  return 0
+}
+
+# cp_bundle_service_ok <service> <user> <render function> <env file name> <packages...>
+cp_bundle_service_ok() {
+  svc="$1"; user="$2"; render="$3"; envfile="$4"; shift 4
+  cp_wants "$svc" || return 0
+  cp_bundle_valid || return 1
+  if cp_is_missing "$svc"; then return 1; fi
+  [ -n "${NCS_CP_REVISION:-}" ] && [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] || return 1
+  [ -s "$(cp_dir)/$envfile" ] || return 1
+  cp_user_ok "$user" || return 1
+  cp_pkgs_ok "$@" || return 1
+  cp_bundle_current || return 1
+  if [ "$svc" = scheduler ]; then cp_ofelia_files_ok || return 1; fi
+  "$render" | cmp -s - "$(cp_unit_file "$svc")" || return 1
+  systemctl is-enabled --quiet "nuit-cloud-cp-$svc.service" || return 1
+  systemctl is-active --quiet "nuit-cloud-cp-$svc.service" || return 1
+  [ "$(cp_applied "$svc")" = "$(cp_marker "$svc")" ]
+}
+
+cp_bundle_service_do() { # same arguments
+  svc="$1"; user="$2"; render="$3"; envfile="$4"; shift 4
+  unit="nuit-cloud-cp-$svc.service"; changed=0; unit_changed=0
+  cp_wants "$svc" || return 0
+  cp_bundle_valid || { echo "  the task carries no usable bundle (version and sha256)" >&2; return 3; }
+  if cp_is_missing "$svc"; then
+    echo "  the platform has no usable secret for $svc yet ($(cp_secret_name "$svc")): put it there, then apply this again" >&2
+    return 3
+  fi
+  [ -n "${NCS_CP_REVISION:-}" ] || { echo "  the task carries no configuration revision" >&2; return 3; }
+  { [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] && [ -s "$(cp_dir)/$envfile" ]; } || { echo "  the configuration for $svc is not written (the agent writes it when it applies)" >&2; return 1; }
+  cp_rc=0; cp_pkgs_do "$@" || cp_rc=$?; [ "$cp_rc" = 0 ] || return "$cp_rc"
+  cp_user_make "$user" || return 1
+  was="$(readlink "$(cp_install)/current" 2>/dev/null || true)"
+  cp_bundle_switch || return 1
+  [ "$was" = "$NCS_CP_BUNDLE_VERSION" ] || changed=1
+  if [ "$svc" = scheduler ]; then
+    cp_rc=0; cp_ofelia_files_do || cp_rc=$?
+    [ "$cp_rc" = 10 ] && changed=1
+    [ "$cp_rc" = 0 ] || [ "$cp_rc" = 10 ] || return 1
+  fi
+  cp_rc=0; "$render" | cp_put "$(cp_unit_file "$svc")" 644 || cp_rc=$?
+  if [ "$cp_rc" = 10 ]; then changed=1; unit_changed=1; elif [ "$cp_rc" != 0 ]; then return 1; fi
+  if [ "$unit_changed" = 1 ]; then systemctl daemon-reload || return 1; fi
+  systemctl enable "$unit" >/dev/null 2>&1 || return 1
+  if [ "$changed" = 1 ] || [ "$(cp_applied "$svc")" != "$(cp_marker "$svc")" ] || ! systemctl is-active --quiet "$unit"; then
+    systemctl restart "$unit" || return 1
+  fi
+  n=0
+  while [ "$n" -lt "${NCS_CP_START_WAIT_SECONDS:-10}" ]; do systemctl is-active --quiet "$unit" && break; n=$((n + 1)); sleep 1; done
+  systemctl is-active --quiet "$unit" || { echo "  $unit did not stay up (journalctl -u $unit says why)" >&2; return 1; }
+  cp_marker "$svc" >"$(cp_dir)/applied-$svc.nuit-new" && mv "$(cp_dir)/applied-$svc.nuit-new" "$(cp_dir)/applied-$svc" || return 1
+  echo "  $svc runs from bundle $NCS_CP_BUNDLE_VERSION (unit $unit, enabled at boot)"
+}
+
+f_ncs_cp_scheduler_ok() { cp_bundle_service_ok scheduler ncs-scheduler cp_render_scheduler scheduler.env curl wget ca-certificates; }
+f_ncs_cp_scheduler_do() { cp_bundle_service_do scheduler ncs-scheduler cp_render_scheduler scheduler.env curl wget ca-certificates; }
+f_ncs_cp_probe_ok() { cp_bundle_service_ok probe ncs-probe cp_render_probe probe.env curl ca-certificates; }
+f_ncs_cp_probe_do() { cp_bundle_service_do probe ncs-probe cp_render_probe probe.env curl ca-certificates; }
+
+# ─── The agent's https front: Debian's own nginx ───────────────────────────────────────────────────────────────────────────────────────────
+# Listens on 8443 only and forwards ONLY /api/agent/ to the platform (NCS_CP_TLS_UPSTREAM), 404 for everything else; the certificate and key are the
+# files the agent wrote (nginx's master reads the key as root). Modest hardening by a drop-in: only what is known safe for Debian's stock unit.
+cp_ngx_conf_file() { p /etc/nginx/conf.d/nuit-cloud-agent-front.conf; }
+cp_ngx_default_site() { p /etc/nginx/sites-enabled/default; }
+cp_ngx_dropin_file() { p /etc/systemd/system/nginx.service.d/10-nuit-cloud.conf; }
 cp_nginx_conf() {
   cat <<CONF
 # Written by nuit-cloud (the ncs_cp_tls_front feature). Forwards ONLY /api/agent/ to the platform; everything else is 404.
 server {
   listen 8443 ssl;
   server_name agent.ops.nuitcloud.com;
-  ssl_certificate     /tls/fullchain.pem;
-  ssl_certificate_key /tls/privkey.pem;
+  ssl_certificate     $(cp_dir)/tls/cert.pem;
+  ssl_certificate_key $(cp_dir)/tls/key.pem;
   ssl_protocols TLSv1.2 TLSv1.3;
   client_max_body_size 1m;
   location /api/agent/ {
@@ -1279,102 +1481,73 @@ server {
 }
 CONF
 }
-
-# The systemd unit for one service, on stdout. Every container: read-only root, no capabilities (the https front adds back the three nginx needs
-# to start its workers), no new privileges, a tmpfs /tmp, a memory limit for a 1 GB machine and a process cap, started by DIGEST.
-cp_render() { # cp_render <service>
-  svc="$1"; img="$(cp_image "$svc")"; dir="$(cp_dir)"; name="ncs-cp-$svc"
-  case "$svc" in
-    scheduler) mem=128m; pids=64; extra="--env-file $dir/scheduler.env" ;;
-    probe) mem=64m; pids=32; extra="--env-file $dir/probe.env -v ncs-cp-probe-data:/data" ;;
-    tls-front) mem=64m; pids=64
-      extra="--network host --cap-add CHOWN --cap-add SETUID --cap-add SETGID --tmpfs /var/cache/nginx --tmpfs /run -v $dir/tls/cert.pem:/tls/fullchain.pem:ro -v $dir/tls/key.pem:/tls/privkey.pem:ro -v $dir/tls/nginx.conf:/etc/nginx/conf.d/default.conf:ro" ;;
-  esac
-  cat <<UNIT
-# Written by nuit-cloud (the ncs_cp_$(printf '%s' "$svc" | tr - _) feature). Starts at boot, with no platform.
-[Unit]
-Description=Nuit Cloud control plane: $svc
-After=docker.service network-online.target
-Wants=docker.service network-online.target
-
+cp_nginx_dropin() {
+  cat <<DROP
+# Written by nuit-cloud (the ncs_cp_tls_front feature): modest limits on Debian's nginx, nothing that could stop it starting.
 [Service]
-Restart=always
-RestartSec=10
-ExecStartPre=-/usr/bin/docker rm -f $name
-ExecStart=/usr/bin/docker run --rm --name $name --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=16m --memory $mem --memory-swap $mem --pids-limit $pids $extra $img
-ExecStop=/usr/bin/docker stop $name
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+MemoryMax=64M
+TasksMax=64
+DROP
 }
-
-# The files the agent wrote for a service are there (their content is the agent's, never read here).
-cp_files_present() {
-  dir="$(cp_dir)"
-  case "$1" in
-    scheduler) [ -s "$dir/scheduler.env" ] ;;
-    probe) [ -s "$dir/probe.env" ] ;;
-    tls-front) [ -s "$dir/tls/cert.pem" ] && [ -s "$dir/tls/key.pem" ] ;;
-  esac
-}
-cp_running_image() { docker inspect --format '{{.Config.Image}}' "ncs-cp-$1" 2>/dev/null || true; }
-cp_nginx_ok() { [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] && cp_nginx_conf | cmp -s - "$(cp_dir)/tls/nginx.conf"; }
-
-cp_ok() { # cp_ok <service>
-  svc="$1"
-  cp_wants "$svc" || return 0
-  cp_image_valid "$svc" || return 1
-  if cp_is_missing "$svc"; then return 1; fi
+f_ncs_cp_tls_front_ok() {
+  cp_wants tls-front || return 0
+  if cp_is_missing tls-front; then return 1; fi
   [ -n "${NCS_CP_REVISION:-}" ] && [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] || return 1
-  cp_files_present "$svc" || return 1
-  if [ "$svc" = tls-front ]; then cp_nginx_ok || return 1; fi
-  cp_render "$svc" | cmp -s - "$(cp_unit_file "$svc")" || return 1
-  systemctl is-active --quiet "nuit-cloud-cp-$svc.service" || return 1
-  [ "$(cp_running_image "$svc")" = "$(cp_image "$svc")" ] || return 1
-  [ "$(cat "$(cp_dir)/applied-$svc" 2>/dev/null || true)" = "$NCS_CP_REVISION" ]
+  [ -s "$(cp_dir)/tls/cert.pem" ] && [ -s "$(cp_dir)/tls/key.pem" ] || return 1
+  [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] || return 1
+  dpkg -s nginx >/dev/null 2>&1 || return 1
+  [ ! -e "$(cp_ngx_default_site)" ] || return 1
+  cp_nginx_conf | cmp -s - "$(cp_ngx_conf_file)" || return 1
+  cp_nginx_dropin | cmp -s - "$(cp_ngx_dropin_file)" || return 1
+  systemctl is-enabled --quiet nginx.service || return 1
+  systemctl is-active --quiet nginx.service || return 1
+  [ "$(cp_applied tls-front)" = "$(cp_marker tls-front)" ]
 }
-
-cp_do() { # cp_do <service>
-  svc="$1"; unit="nuit-cloud-cp-$svc.service"; dir="$(cp_dir)"; changed=0
-  cp_wants "$svc" || return 0
-  cp_image_valid "$svc" || { echo "  the task carries no image pinned by digest for $svc" >&2; return 3; }
-  if cp_is_missing "$svc"; then
-    echo "  the platform has no usable secret for $svc yet ($(cp_secret_name "$svc")): put it there, then apply this again" >&2
+f_ncs_cp_tls_front_do() {
+  cp_wants tls-front || return 0
+  if cp_is_missing tls-front; then
+    echo "  the platform has no usable secret for tls-front yet ($(cp_secret_name tls-front)): put it there, then apply this again" >&2
     return 3
   fi
   [ -n "${NCS_CP_REVISION:-}" ] || { echo "  the task carries no configuration revision" >&2; return 3; }
-  [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] && cp_files_present "$svc" || { echo "  the configuration files for $svc are not written (the agent writes them when it applies)" >&2; return 1; }
-  command -v docker >/dev/null 2>&1 || { echo "  the container engine is not installed" >&2; return 1; }
-  if [ "$svc" = tls-front ]; then
-    [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] || { echo "  the platform has not said where the https front forwards /api/agent/ to (tlsFront.upstream)" >&2; return 3; }
-    if ! cp_nginx_ok; then
-      cp_nginx_conf >"$dir/tls/nginx.conf.nuit-new" && chmod 644 "$dir/tls/nginx.conf.nuit-new" && mv "$dir/tls/nginx.conf.nuit-new" "$dir/tls/nginx.conf" || return 1
-      changed=1
-    fi
+  { [ "$(cp_revision_on_disk)" = "$NCS_CP_REVISION" ] && [ -s "$(cp_dir)/tls/cert.pem" ] && [ -s "$(cp_dir)/tls/key.pem" ]; } || { echo "  the certificate and key are not written (the agent writes them when it applies)" >&2; return 1; }
+  [ -n "${NCS_CP_TLS_UPSTREAM:-}" ] || { echo "  the platform has not said where the https front forwards /api/agent/ to (tlsFront.upstream)" >&2; return 3; }
+  changed=0; unit_changed=0
+  if ! dpkg -s nginx >/dev/null 2>&1; then
+    net_resolves || return 3
+    # the package starts nginx on install, with Debian's default site on port 80: say no to that start, and take the site out before it ever runs
+    rcd="$(p /usr/sbin/policy-rc.d)"; made=0
+    if [ ! -e "$rcd" ]; then mkdir -p "$(dirname "$rcd")" && printf '#!/bin/sh\nexit 101\n' >"$rcd" && chmod 755 "$rcd" && made=1; fi
+    cp_rc=0; { apt-get update -qq && apt-get install -y -qq nginx; } || cp_rc=$?
+    if [ "$made" = 1 ]; then rm -f "$rcd"; fi
+    [ "$cp_rc" = 0 ] || return "$cp_rc"
+    changed=1
   fi
-  img="$(cp_image "$svc")"
-  docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null || { echo "  could not pull $img (can this machine reach its registry?)" >&2; return 1; }
-  uf="$(cp_unit_file "$svc")"; mkdir -p "$(dirname "$uf")"
-  cp_render "$svc" >"$uf.nuit-new" || return 1
-  if [ -f "$uf" ] && cmp -s "$uf.nuit-new" "$uf"; then rm -f "$uf.nuit-new"; else chmod 644 "$uf.nuit-new" && mv "$uf.nuit-new" "$uf" || return 1; changed=1; fi
-  if [ "$changed" = 1 ]; then systemctl daemon-reload || return 1; fi
-  systemctl enable "$unit" >/dev/null 2>&1 || return 1
-  if [ "$changed" = 1 ] || [ "$(cat "$dir/applied-$svc" 2>/dev/null || true)" != "$NCS_CP_REVISION" ] || ! systemctl is-active --quiet "$unit" || [ "$(cp_running_image "$svc")" != "$img" ]; then
-    systemctl restart "$unit" || return 1
+  if [ -e "$(cp_ngx_default_site)" ] || [ -L "$(cp_ngx_default_site)" ]; then rm -f "$(cp_ngx_default_site)" || return 1; changed=1; fi
+  cp_rc=0; cp_nginx_dropin | cp_put "$(cp_ngx_dropin_file)" 644 || cp_rc=$?
+  if [ "$cp_rc" = 10 ]; then unit_changed=1; elif [ "$cp_rc" != 0 ]; then return 1; fi
+  if [ "$unit_changed" = 1 ]; then systemctl daemon-reload || return 1; fi
+  conf="$(cp_ngx_conf_file)"; backup=""
+  if [ -f "$conf" ]; then backup="$conf.nuit-old"; cp "$conf" "$backup" || return 1; fi
+  cp_rc=0; cp_nginx_conf | cp_put "$conf" 644 || cp_rc=$?
+  if [ "$cp_rc" = 10 ]; then changed=1; elif [ "$cp_rc" != 0 ]; then return 1; fi
+  # nothing is reloaded or restarted before nginx itself says the configuration is good; a bad one is taken out again
+  if ! out="$(nginx -t 2>&1)"; then
+    if [ -n "$backup" ]; then mv "$backup" "$conf"; else rm -f "$conf"; fi
+    echo "  nginx -t refused the configuration, so it was not applied (and the old one was put back): $(printf '%s' "$out" | head -n 1 | cut -c1-200)" >&2
+    return 1
   fi
-  n=0
-  while [ "$n" -lt "${NCS_CP_START_WAIT_SECONDS:-30}" ]; do
-    systemctl is-active --quiet "$unit" && [ "$(cp_running_image "$svc")" = "$img" ] && break
-    n=$((n + 1)); sleep 1
-  done
-  printf '%s\n' "$NCS_CP_REVISION" >"$dir/applied-$svc" || return 1
-  echo "  $svc runs from $img (unit $unit, enabled at boot)"
+  [ -z "$backup" ] || rm -f "$backup"
+  systemctl enable nginx.service >/dev/null 2>&1 || return 1
+  if [ "$unit_changed" = 1 ] || ! systemctl is-active --quiet nginx.service; then
+    systemctl restart nginx.service || return 1
+  elif [ "$changed" = 1 ] || [ "$(cp_applied tls-front)" != "$(cp_marker tls-front)" ]; then
+    systemctl reload nginx.service || return 1
+  fi
+  systemctl is-active --quiet nginx.service || { echo "  nginx did not stay up (journalctl -u nginx says why)" >&2; return 1; }
+  cp_marker tls-front >"$(cp_dir)/applied-tls-front.nuit-new" && mv "$(cp_dir)/applied-tls-front.nuit-new" "$(cp_dir)/applied-tls-front" || return 1
+  echo "  nginx forwards /api/agent/ on port 8443 to $NCS_CP_TLS_UPSTREAM"
 }
-
-f_ncs_cp_scheduler_ok() { cp_ok scheduler; }
-f_ncs_cp_scheduler_do() { cp_do scheduler; }
-f_ncs_cp_tls_front_ok() { cp_ok tls-front; }
-f_ncs_cp_tls_front_do() { cp_do tls-front; }
-f_ncs_cp_probe_ok() { cp_ok probe; }
-f_ncs_cp_probe_do() { cp_do probe; }

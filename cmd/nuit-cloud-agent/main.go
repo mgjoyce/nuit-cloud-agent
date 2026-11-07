@@ -197,7 +197,7 @@ func run(args []string) error {
 			Profiles:     profiles.Runner{},
 			PlatformURL:  c.BaseURL,
 			Runtime:      runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")},
-			ControlPlane: controlplane.Provisioner{Source: c, PlatformURL: c.BaseURL},
+			ControlPlane: controlplane.Provisioner{Source: c, Fetcher: runtimeinstall.Stager{BaseURL: c.BaseURL, HTTP: c, Dir: filepath.Join(*dir, "stage")}, StageDir: filepath.Join(*dir, "stage"), PlatformURL: c.BaseURL},
 			Updater:      update.Updater{BaseURL: c.BaseURL, HTTP: c, ExePath: exe, StateDir: *dir, Version: version, Arch: runtime.GOARCH, State: st},
 			Restart:      restart,
 		},

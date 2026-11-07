@@ -142,6 +142,14 @@ func named(file, arch string) string {
 	return strings.TrimSuffix(file, ".tar.gz") + "-" + arch + ".tar.gz"
 }
 
+// Fetch downloads one of the files the platform serves under /api/agent/download/ into dst (which must not exist), refusing more than
+// limit bytes, and keeps it only if its SHA-256 is want. The same code path as the runtime's own files: the agent's client, so the
+// platform's name and its fallback addresses are used and TLS is checked against the name. Other packages (the control-plane bundle)
+// use it so there is one download path.
+func (s Stager) Fetch(ctx context.Context, name, dst, want string, limit int64) (string, error) {
+	return s.fetch(ctx, name, dst, want, limit)
+}
+
 func (s Stager) fetch(ctx context.Context, name, dst, want string, limit int64) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.BaseURL, "/")+"/api/agent/download/"+name, nil)
 	if err != nil {
